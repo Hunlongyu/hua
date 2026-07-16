@@ -1,0 +1,12 @@
+<svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="hua 应用图标：绿色空心鼠标轮廓，中间一个实心字母 H">
+  <title>hua logo</title>
+  <desc>鼠标手势工具 hua（划）的标志：圆润的鼠标外形以绿色描边构成，内部立着一个实心的字母 H，鼠标与 H 融为一体，无背景色块。</desc>
+  <g fill="none" stroke="#07C160" stroke-width="26" stroke-linejoin="round">
+    <path d="M 156 196 L 156 352 A 64 64 0 0 0 220 416 L 292 416 A 64 64 0 0 0 356 352 L 356 196 A 100 100 0 0 0 156 196 Z"/>
+  </g>
+  <g fill="#07C160">
+    <rect x="201" y="192" width="28" height="150" rx="13"/>
+    <rect x="283" y="192" width="28" height="150" rx="13"/>
+    <rect x="201" y="253" width="110" height="28" rx="13"/>
+  </g>
+</svg>

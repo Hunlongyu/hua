@@ -1,0 +1,9 @@
+/* 资源脚本：应用清单 + 应用图标。
+ * CREATEPROCESS_MANIFEST_RESOURCE_ID(1) + RT_MANIFEST(24) 由 winuser.h 提供。 */
+#include <winuser.h>
+#include "resource.h"
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+
+/* 多尺寸图标（16/32/48/256），窗口类与托盘共用。路径相对本 .rc 文件。 */
+IDI_APP ICON "../assets/app.ico"
