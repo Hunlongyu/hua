@@ -1,0 +1,22 @@
+# 统一换行符：仓库内一律存 LF，签出也用 LF（Windows 工具链与 MSVC/RC 均无问题）。
+# 避免不同机器 core.autocrlf 设置不同导致整文件 diff。
+* text=auto eol=lf
+
+# 二进制文件：禁止任何换行符/文本转换
+*.ico  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.exe  binary
+*.dll  binary
+
+# 语言归类（GitHub 语言统计与 diff 高亮）
+*.c   text diff=cpp
+*.h   text diff=cpp
+*.rc  text
+*.ini text
+*.md  text diff=markdown
+
+# 第三方 vendored 源码：不计入语言统计
+third_party/** linguist-vendored
