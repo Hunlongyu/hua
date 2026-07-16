@@ -21,6 +21,16 @@ static bool cieq(const char *a, const char *b)
     return *a == *b;
 }
 
+/* s 是否以 prefix（长 n）开头，大小写不敏感。纯 ASCII、locale 无关，与 cieq 同源。 */
+static bool ci_prefix(const char *s, const char *prefix, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (!s[i] || tolower((unsigned char)s[i]) != tolower((unsigned char)prefix[i]))
+            return false;
+    }
+    return true;
+}
+
 static void copy_str(char *dst, size_t cap, const char *src)
 {
     if (cap == 0) return;
@@ -169,8 +179,10 @@ static int handler(void *user, const char *section, const char *name,
         return 1;
     }
 
-    /* [App:xxx] */
-    if (strncmp(section, "App:", 4) == 0 || strncmp(section, "app:", 4) == 0) {
+    /* [App:xxx] —— 前缀大小写不敏感。此前只硬编码了 "App:"/"app:" 两种写法，
+     * [APP:chrome.exe] 会被静默忽略（既无诊断、per-app 覆盖也完全失效），
+     * 与本文件其余各处一律用 cieq 的约定也不一致。 */
+    if (ci_prefix(section, "app:", 4)) {
         AppConfig *a = find_or_create_app(c, section + 4);
         if (a) {
             if (cieq(name, "Enabled"))

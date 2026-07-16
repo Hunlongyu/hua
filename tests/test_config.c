@@ -199,6 +199,18 @@ UTEST(config, app_override_and_enabled)
     ASSERT_FALSE(game->enabled);
 }
 
+UTEST(config, app_section_prefix_case_insensitive)
+{
+    Config c;
+    /* 节名前缀也必须大小写不敏感：此前只认 "App:"/"app:"，[APP:] 会被静默忽略，
+     * per-app 覆盖完全失效且无任何诊断。 */
+    config_parse_string(&c,
+        "[APP:chrome.exe]\n26=key:ctrl+w\n"
+        "[ApP:firefox.exe]\n26=key:ctrl+w\n");
+    ASSERT_TRUE(config_find_app(&c, "chrome.exe") != NULL);
+    ASSERT_TRUE(config_find_app(&c, "firefox.exe") != NULL);
+}
+
 UTEST(config, app_name_case_insensitive)
 {
     Config c;
