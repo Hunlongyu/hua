@@ -93,6 +93,17 @@ Enabled = false           ; 该程序禁用手势
 
 改完在托盘点"重载配置"，或直接保存文件即自动热加载。
 
+## 许可证
+
+本项目以 [MIT License](LICENSE) 发布。
+
+第三方组件（源码内联编译，无运行时 DLL 依赖）：
+
+| 组件 | 用途 | 许可证 |
+|---|---|---|
+| [inih](https://github.com/benhoyt/inih) | `.ini` 配置解析 | BSD-3-Clause，见 [third_party/inih-LICENSE.txt](third_party/inih-LICENSE.txt) |
+| [utest.h](https://github.com/sheredom/utest.h) | 单元测试框架（仅测试，不进产物） | Unlicense |
+
 ## 设计文档
 
 见 [docs/hua-design.md](docs/hua-design.md)。

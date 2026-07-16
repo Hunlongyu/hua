@@ -27,6 +27,10 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item build/Release/hua.exe dist/
           Copy-Item config/hua.ini dist/
+          # 许可证必须随二进制分发：hua.exe 内联编译了 inih（BSD-3-Clause），
+          # 其第 2 条要求二进制分发在随附材料中重现版权声明与免责条款。
+          Copy-Item LICENSE dist/
+          Copy-Item third_party/inih-LICENSE.txt dist/
           Compress-Archive -Path dist/* -DestinationPath hua.zip -Force
 
       - name: Upload artifact
