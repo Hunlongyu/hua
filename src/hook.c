@@ -110,8 +110,12 @@ static void synth_click(HuaTrigger t)
     case HUA_TRIGGER_MIDDLE: down = MOUSEEVENTF_MIDDLEDOWN; up = MOUSEEVENTF_MIDDLEUP; break;
     case HUA_TRIGGER_X1:     down = MOUSEEVENTF_XDOWN; up = MOUSEEVENTF_XUP; data = XBUTTON1; break;
     case HUA_TRIGGER_X2:     down = MOUSEEVENTF_XDOWN; up = MOUSEEVENTF_XUP; data = XBUTTON2; break;
-    default: return;
     }
+    /* 不写 default：那会压制 MSVC 的 C4062（/W4 默认开启），使得将来新增触发键时
+     * 这里悄无声息，而 is_trigger_down/is_trigger_up 会照常告警——补发路径静默失效
+     * 比编译告警难查得多。未覆盖的枚举值落到这里，按「无法补发」处理。 */
+    if (!down)
+        return;
     in[0].type = INPUT_MOUSE;
     in[0].mi.dwFlags = down;
     in[0].mi.mouseData = data;
@@ -272,32 +276,38 @@ bool hook_looks_dead(void)
     POINT p;
     ULONGLONG now = GetTickCount64();
     if (!GetCursorPos(&p)) {
-        /* 拿不到光标就不臆断，但仍要推进基线时刻，
-         * 否则下个周期会拿一个过期的 g_wd_tick 去比较。 */
+        /* 取不到光标（切到非输入桌面时会失败）：零信息。推进基线时刻避免下周期
+         * 拿过期值比较，但**不能**清 g_suspect —— 那等于把已积累的证据丢掉。 */
         g_wd_tick = now;
-        g_suspect = 0;
         return false;
     }
 
     bool moved = (p.x != g_wd_pos.x || p.y != g_wd_pos.y);
-    /* 上个周期内有移动，但最近一次回调早于上次探活时刻 → 事件没进来 */
-    bool suspect = moved && g_wd_tick != 0 && g_last_cb_tick < g_wd_tick;
+    /* 本周期内确实收到过回调 —— 这是唯一能证明钩子存活的证据。 */
+    bool alive   = (g_wd_tick != 0 && g_last_cb_tick >= g_wd_tick);
+    /* 动过却零事件 → 可疑。 */
+    bool suspect = (g_wd_tick != 0 && moved && g_last_cb_tick < g_wd_tick);
 
     g_wd_pos.x = (int)p.x;
     g_wd_pos.y = (int)p.y;
     g_wd_tick  = now;
 
     /*
-     * 单周期就下结论会误判：安全桌面（UAC 同意框、锁屏、Ctrl+Alt+Del）期间
-     * 鼠标事件不派发到我们的钩子，但 GetCursorPos 读的是全局光标位置、照样在变；
-     * SetCursorPos 类工具（mouse jiggler 等）移动光标也不产生鼠标事件。
-     * 故要求连续两个周期都可疑才判定，代价是恢复延迟 3s→6s，远优于误重装
-     * （误重装若撞上进行中的手势，会清掉 g_suppress_trigger_up 导致孤儿 Up 泄漏）。
+     * 三态而非两态，这是关键：「光标没动」既不能证明钩子活着、也不能证明它死了，
+     * 是**零信息**，必须保留已积累的证据。若把它当作健康证据去清零计数器，那么
+     * 钩子死后用户以最常见的间歇方式用鼠标（动→停→动→停），计数器永远到不了 2，
+     * watchdog 将无限期不触发 —— 恰恰在它唯一存在的理由上失效。
+     *
+     * 要求连续两周期可疑才判定，是为了滤掉误判：安全桌面（UAC 同意框、锁屏、
+     * Ctrl+Alt+Del）期间鼠标事件不派发到我们的钩子，但 GetCursorPos 读的是全局
+     * 光标位置、照样在变；SetCursorPos 类工具（mouse jiggler 等）同理。
      */
-    if (!suspect) {
+    if (alive) {
         g_suspect = 0;
         return false;
     }
+    if (!suspect)
+        return false;   /* 零信息：保留计数，绝不清零 */
     g_suspect++;
     if (g_suspect < 2)
         return false;
@@ -329,13 +339,21 @@ size_t hook_snapshot(const Pt **out)
 bool hook_cancel_if_timed_out(DWORD timeout_ms, HookTimeoutInfo *info)
 {
     /*
-     * ST_TENTATIVE 也必须纳入超时兜底。它是「Down 已吞、位移还没到 TriggerDistance」
-     * 的窗口期：若此时输入被切走且我们收不到 Up（UAC 安全桌面、Win+L 锁屏、
-     * Ctrl+Alt+Del、RDP 切换，或被更前面的钩子吃掉），状态会永久卡在 TENTATIVE，
-     * TIMER_FRAME 空转不停；等用户回来随手动一下鼠标，位移超过阈值就会转入
-     * ST_ACTIVE —— 于是一条没人按键的「幽灵轨迹」跟着光标跑，还会弹出动作名。
+     * 只兜底 ST_ACTIVE，**不要**把 ST_TENTATIVE 也纳进来。
+     *
+     * 曾经试图纳入，动机是：UAC 安全桌面/锁屏吞掉 Up 时状态会卡在 TENTATIVE，
+     * 用户回来一动鼠标就转入 ACTIVE，出现一条没人按键的「幽灵轨迹」。
+     * 但那样会打断一个日常高频操作：按住右键不动想一下再松手。track_point 只在
+     * 坐标变化时刷新 g_last_input_tick，手不动就必定判超时 —— 于是 Down 已被吞、
+     * Up 又被 g_suppress_trigger_up 吞掉，这次右键凭空消失（已实测复现）。
+     *
+     * 也无法用 GetAsyncKeyState 区分「按住不动」与「Up 丢了」：Down 正是被我们
+     * 自己吞掉的（回调返回 1），系统从未更新按键状态，实测全程读到「未按下」。
+     *
+     * 而幽灵轨迹是**会自愈**的：它一旦转入 ACTIVE，用户停手 PauseTimeout 后就被
+     * 下面这段收掉。用一个会自愈的观感问题去换掉核心交互，不划算。
      */
-    if ((g_state != ST_ACTIVE && g_state != ST_TENTATIVE) || timeout_ms == 0)
+    if (g_state != ST_ACTIVE || timeout_ms == 0)
         return false;
 
     ULONGLONG elapsed = GetTickCount64() - g_last_input_tick;
