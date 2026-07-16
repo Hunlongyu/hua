@@ -243,14 +243,25 @@ static const char *match_gestures(const Gesture *g, size_t n, const char *seq,
     return idx >= 0 ? g[idx].action : NULL;
 }
 
+/* cmd:none = 显式「无动作」。主要用于 per-app 屏蔽某个全局手势
+ * （如 39=key:f5 在 PPT 里会触发放映，可用 [App:powerpnt.exe] 39=cmd:none 挡掉）。
+ * 归一到「未匹配」语义：调用方拿到 NULL，浮层照常提示「手势无动作」。 */
+static bool is_none_action(const char *a)
+{
+    return a && (cieq(a, "cmd:none") || cieq(a, "none"));
+}
+
 const char *config_resolve(const Config *c, const char *exe_lower, const char *seq)
 {
     const AppConfig *app = exe_lower ? config_find_app(c, exe_lower) : NULL;
     if (app) {
         const char *a = match_gestures(app->gestures, app->gesture_count,
                                        seq, c->tolerance);
+        /* 程序覆盖优先；命中 cmd:none 必须就地返回 NULL，绝不能回落到全局映射，
+         * 否则屏蔽不生效。 */
         if (a)
-            return a;   /* 程序覆盖优先 */
+            return is_none_action(a) ? NULL : a;
     }
-    return match_gestures(c->gestures, c->gesture_count, seq, c->tolerance);
+    const char *g = match_gestures(c->gestures, c->gesture_count, seq, c->tolerance);
+    return is_none_action(g) ? NULL : g;
 }

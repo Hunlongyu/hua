@@ -274,6 +274,7 @@ const char *action_label(const char *value)
         const char *k = value + 4;
         if (!_stricmp(k, "alt+left"))  return "后退";
         if (!_stricmp(k, "alt+right")) return "前进";
+        if (!_stricmp(k, "f5"))        return "刷新";
         if (!_stricmp(k, "ctrl+w"))    return "关闭标签页";
         if (!_stricmp(k, "ctrl+t"))    return "新建标签页";
         if (!_stricmp(k, "delete"))    return "删除";

@@ -242,6 +242,34 @@ UTEST(resolve, app_falls_back_to_global)
     ASSERT_STREQ(config_resolve(&c, "chrome.exe", "6"), "key:alt+right");
 }
 
+UTEST(resolve, app_none_suppresses_global)
+{
+    Config c;
+    config_parse_string(&c,
+        "[Gestures]\n39=key:f5\n"
+        "[App:powerpnt.exe]\n39=cmd:none\n");
+    /* PPT 里 39 被显式屏蔽：必须返回 NULL，绝不能回落到全局的 key:f5 */
+    ASSERT_TRUE(config_resolve(&c, "powerpnt.exe", "39") == NULL);
+    /* 其他程序不受影响 */
+    ASSERT_STREQ(config_resolve(&c, "notepad.exe", "39"), "key:f5");
+}
+
+UTEST(resolve, global_none_is_no_action)
+{
+    Config c;
+    config_parse_string(&c, "[Gestures]\n39=cmd:none\n");
+    ASSERT_TRUE(config_resolve(&c, "notepad.exe", "39") == NULL);
+}
+
+UTEST(resolve, none_is_case_insensitive)
+{
+    Config c;
+    config_parse_string(&c,
+        "[Gestures]\n39=key:f5\n"
+        "[App:foo.exe]\n39=CMD:NONE\n");
+    ASSERT_TRUE(config_resolve(&c, "foo.exe", "39") == NULL);
+}
+
 UTEST(resolve, tolerance_fuzzy)
 {
     Config c;
