@@ -117,6 +117,12 @@ static const char *trigger_name(CfgTrigger trigger)
 /* 钩子门控：按手势起点下方的程序 + 全屏状态决定是否生效。 */
 static bool gesture_gate(HWND target)
 {
+    /* 目标是我们自己的窗口时一律不接管。托盘菜单弹出期间照样能划手势，而目标经
+     * GA_ROOTOWNER 会解析到 g_hwnd —— 在自己的菜单上划「下右」就会对自己执行
+     * cmd:close_window，程序莫名其妙自我关闭。自身窗口上的手势没有任何意义。 */
+    if (target == g_hwnd)
+        return false;
+
     char exe[CFG_MAX_EXE];
     bool has = window_exe_lower(target, exe, sizeof(exe));
     bool fs = ctx_is_fullscreen(target);
@@ -204,7 +210,13 @@ static void load_config(void)
             HUA_LOG_W("配置疑似 UTF-16 编码（含嵌入 NUL），只能解析到前 %zu/%zu 字节，"
                       "手势多半会全部失效；请将 hua.ini 另存为 UTF-8。",
                       strlen(text), raw_len);
-        config_parse_string(&g_config, text);   /* 内部先 set_defaults */
+
+        /* 坏行会被 inih 跳过，但必须告诉用户——否则那条手势只是「莫名其妙不生效」。
+         * 注意超长行（> INI_MAX_LINE）是被截断后照常解析的，不是整行丢弃。 */
+        int bad_line = 0;
+        config_parse_string_ex(&g_config, text, &bad_line);   /* 内部先 set_defaults */
+        if (bad_line > 0)
+            HUA_LOG_W("配置第 %d 行解析有误（该行已跳过；也可能是行超长被截断）", bad_line);
         hua_free(text);
         char *p8 = hua_utf16_to_utf8(g_ini_path);
         HUA_LOG_I("配置已加载：%d 个全局手势、%d 个程序覆盖（%s）",
@@ -271,8 +283,13 @@ static DWORD WINAPI watch_proc(LPVOID arg)
     HANDLE h = FindFirstChangeNotificationW(
         g_watch_dir, FALSE,
         FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME);
-    if (h == INVALID_HANDLE_VALUE)
+    if (h == INVALID_HANDLE_VALUE) {
+        /* 静默退出会让热加载永久失效，而 g_watch_thread 仍非空 → watch_start 以为
+         * 监听还活着，用户也完全无从察觉。至少要留下日志。 */
+        HUA_LOG_W("监听配置目录失败: %lu（热加载不可用，请用托盘「重载配置」）",
+                  GetLastError());
         return 0;
+    }
 
     /* 建立监听后记录基线，之后只接受 ini 实际内容变化。 */
     ZeroMemory(&g_watch_fingerprint, sizeof(g_watch_fingerprint));
@@ -608,6 +625,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     }
 
     switch (msg) {
+    case WM_CLOSE:
+        /* 只经托盘「退出」退出。本窗口是顶层窗口（必须如此才能收到 TaskbarCreated），
+         * 因而也会收到部分工具广播的 WM_CLOSE —— 交给 DefWindowProcW 就是 DestroyWindow
+         * → 进程静默退出。message-only 窗口时代不收广播，故无此问题。 */
+        return 0;
+
     case WM_HUA_TRAY:
         /* lParam 携带原始鼠标消息（未升级到 NOTIFYICON_VERSION_4）。 */
         if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
@@ -655,17 +678,25 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             overlay_end();
 
             if (action) {
+                /* action 是指向 g_config 的裸指针，而 action_execute 的 run: 分支会
+                 * 调 ShellExecuteW —— 它会泵消息，可能在其内部重入派发 WM_HUA_RELOAD，
+                 * 于是 load_config 把整个 g_config memset 掉。对象仍有效（静态数组）
+                 * 故不是 UB，但之后的日志会打出陈旧/空的动作名。先拷一份再执行。 */
+                char action_copy[CFG_MAX_ACTION];
+                strncpy(action_copy, action, sizeof(action_copy) - 1);
+                action_copy[sizeof(action_copy) - 1] = '\0';
+
                 /* 日志必须在执行之后并带上结果：动作可能静默失败（如目标窗口
                  * 因前台锁定策略拒绝 SetForegroundWindow，一个键都没发出去）。
                  * 先打「→ key:ctrl+w」再执行，会让日志断言一件没发生的事，
                  * 用户报「手势偶尔失灵」时把排查引向完全错误的方向。 */
-                bool ok = action_execute(action, target);
+                bool ok = action_execute(action_copy, target);
                 if (ok) {
                     HUA_LOG_I("手势 \"%s\" [%s] → %s", seq,
-                              g_active_has_exe ? g_active_exe : "?", action);
+                              g_active_has_exe ? g_active_exe : "?", action_copy);
                 } else {
                     HUA_LOG_W("手势 \"%s\" [%s] → %s 执行失败", seq,
-                              g_active_has_exe ? g_active_exe : "?", action);
+                              g_active_has_exe ? g_active_exe : "?", action_copy);
                 }
             } else {
                 HUA_LOG_I("手势 \"%s\" → 未匹配%s", seq,
@@ -861,6 +892,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         goto cleanup_mutex;
     }
 
+    hook_set_gate(gesture_gate);
+    load_config();
+
+    /*
+     * 顺序要紧：autostart_reconcile 会同步等 schtasks（最多 5s，且不泵消息）。
+     * 必须把它排在**创建窗口与装钩子之前**，有两个独立的理由：
+     *   1) LL 钩子回调必须靠本线程检索消息才能派发，超过 LowLevelHooksTimeout
+     *      （默认 300ms）系统就静默摘钩且不通知。开机自启场景下 schtasks 冷启动
+     *      常达数百毫秒，钩子会在消息循环启动前就被摘掉，表现为托盘正常、日志
+     *      「就绪」、但手势整个会话无响应。
+     *   2) 我们的窗口是顶层窗口（见下），一旦创建就是广播目标。此时若卡在
+     *      schtasks 上不泵消息，别的进程 SendMessageTimeout(HWND_BROADCAST, ...)
+     *      （如安装器改 PATH 后广播 WM_SETTINGCHANGE）会被我们拖到超时。
+     */
+    autostart_reconcile();
+
     /*
      * 这里**不能**用 message-only 窗口（HWND_MESSAGE）：MSDN 明定 message-only
      * 窗口不接收广播消息，而资源管理器重启后的 TaskbarCreated 是经 HWND_BROADCAST
@@ -889,16 +936,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     if (!overlay_init(hInstance))
         HUA_LOG_W("overlay 初始化失败（浮层不可用，不影响手势）");
 
-    hook_set_gate(gesture_gate);
-    load_config();
-    /*
-     * 顺序要紧：autostart_reconcile 会同步等 schtasks（最多 5s，且不泵消息）。
-     * LL 钩子回调必须靠本线程检索消息才能派发，超过 LowLevelHooksTimeout（默认
-     * 300ms）系统就静默摘钩且不通知。故必须在装钩子之前把它跑完，否则开机自启
-     * 场景下（schtasks 冷启动常达数百毫秒）钩子会在消息循环启动前就被摘掉，
-     * 表现为托盘正常、日志「就绪」、但手势整个会话无响应。
-     */
-    autostart_reconcile();
     apply_hook_config();
     watch_start();
     /* 钩子可能被系统静默摘掉（回调超时），且无任何通知 → 定期探活重装。 */

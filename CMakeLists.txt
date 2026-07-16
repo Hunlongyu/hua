@@ -49,6 +49,11 @@ endif()
 # 独立成 target：它是 vendored 代码，不该被我们的 /W4 刷屏，也不该为它改上游源码。
 add_library(hua_inih STATIC third_party/ini.c)
 target_include_directories(hua_inih PUBLIC third_party)
+# 关掉多行值：本格式（key = value 单行）用不到它，开着反而有害——缩进行会被当成
+# 上一个 key 的续行、用同名 key 再调一次 handler，于是 add_global_gesture 追加出
+# 一条重复的手势（而非替换），白耗 CFG_MAX_GESTURES 槽位。
+# PUBLIC：inih 是头文件里的 #ifdef 开关，消费者（config.c）编译时也必须看到同一定义。
+target_compile_definitions(hua_inih PUBLIC INI_ALLOW_MULTILINE=0)
 
 # -------- 纯逻辑静态库（主程序与测试共用，零 Win32 依赖）--------
 add_library(hua_core STATIC

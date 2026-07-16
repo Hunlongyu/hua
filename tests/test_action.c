@@ -57,6 +57,18 @@ UTEST(parse_key, function_key)
     KeyCombo k;
     ASSERT_TRUE(action_parse_key("f5", &k));
     ASSERT_EQ(k.vk, VK_F5);
+    ASSERT_TRUE(action_parse_key("f24", &k));
+    ASSERT_EQ(k.vk, VK_F24);
+}
+
+UTEST(parse_key, function_key_rejects_trailing_garbage)
+{
+    KeyCombo k;
+    /* atoi 会忽略尾部垃圾：不整串校验的话 "f12abc" 会被静默当成 F12。 */
+    ASSERT_FALSE(action_parse_key("f12abc", &k));
+    ASSERT_FALSE(action_parse_key("f5x", &k));
+    ASSERT_FALSE(action_parse_key("f0", &k));    /* 越界：f1..f24 */
+    ASSERT_FALSE(action_parse_key("f25", &k));
 }
 
 UTEST(parse_key, named_esc)

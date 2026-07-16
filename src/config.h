@@ -88,6 +88,11 @@ void config_set_defaults(Config *c);
  * 文件读取由调用方负责（保持本模块纯逻辑、可脱离系统单测）。 */
 bool config_parse_string(Config *c, const char *text);
 
+/* 同上，但回报首个解析出错的行号（0 = 无错）。坏行虽被跳过，调用方仍应据此告警：
+ * 静默跳过会让用户的手势莫名不生效而无从排查。注意本模块零 Win32 依赖、不能自己
+ * 打日志，故把行号交回给调用方。 */
+bool config_parse_string_ex(Config *c, const char *text, int *out_bad_line);
+
 /* 全局手势查找：命中返回 action 指针，否则 NULL。 */
 const char *config_lookup_global(const Config *c, const char *seq);
 

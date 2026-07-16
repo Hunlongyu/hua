@@ -238,13 +238,20 @@ static void config_clamp(Config *c)
     c->text_position       = clamp_int(c->text_position,   -10000, 10000);
 }
 
-bool config_parse_string(Config *c, const char *text)
+bool config_parse_string_ex(Config *c, const char *text, int *out_bad_line)
 {
     config_set_defaults(c);
     int r = ini_parse_string(text, handler, c);
     config_clamp(c);
+    if (out_bad_line)
+        *out_bad_line = (r > 0) ? r : 0;
     /* r>0 = 某行解析错（坏行已跳过）；-2 = 内存不足。除内存外都视为成功。 */
     return r != -2;
+}
+
+bool config_parse_string(Config *c, const char *text)
+{
+    return config_parse_string_ex(c, text, NULL);
 }
 
 /* ---------------- 查找 ---------------- */

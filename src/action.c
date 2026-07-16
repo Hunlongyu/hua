@@ -31,11 +31,16 @@ static WORD key_name_to_vk(const char *t)
         return 0;
     }
 
-    /* 功能键 f1..f24 */
+    /* 功能键 f1..f24。整串校验：atoi 会忽略尾部垃圾，"f12abc" 也会被当成 F12。 */
     if (t[0] == 'f' && isdigit((unsigned char)t[1])) {
-        int n = atoi(t + 1);
-        if (n >= 1 && n <= 24)
-            return (WORD)(VK_F1 + (n - 1));
+        const char *p = t + 1;
+        while (isdigit((unsigned char)*p))
+            p++;
+        if (*p == '\0') {   /* 数字之后必须就是结尾 */
+            int n = atoi(t + 1);
+            if (n >= 1 && n <= 24)
+                return (WORD)(VK_F1 + (n - 1));
+        }
     }
 
     static const struct { const char *name; WORD vk; } map[] = {
