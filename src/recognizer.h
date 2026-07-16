@@ -17,6 +17,13 @@ typedef struct {
 } Pt;
 
 /*
+ * 方向串缓冲的约定容量（含结尾 '\0'）。rec_encode 的输出契约，调用方的缓冲
+ * 应按此声明——若各处自行硬编码且不慎写小了，rec_encode 会静默截断方向串，
+ * 表现为手势莫名匹配不上，且无任何报错或日志。
+ */
+#define REC_MAX_SEQ 64
+
+/*
  * 点序列 → 方向串。
  * - min_dist：单方向被采纳/转折确认的最小累计位移（像素）。低于阈值的抖动被抹掉。
  * - 相邻同向自动合并；输出如 "6"、"26"、"2141"。
@@ -26,7 +33,8 @@ typedef struct {
 size_t rec_encode(const Pt *pts, size_t n, int min_dist,
                   char *out, size_t out_cap);
 
-/* 标准 Levenshtein 编辑距离。 */
+/* 标准 Levenshtein 编辑距离。
+ * 输入长度须 <= REC_MAX_SEQ（方向串与手势模板均满足）；超长返回 -1。 */
 int rec_levenshtein(const char *a, const char *b);
 
 /*
