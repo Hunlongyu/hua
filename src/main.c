@@ -165,6 +165,7 @@ static void resolve_ini_path(void)
         path[MAX_PATH - 1] = L'\0';
         if (hua_file_exists(path)) {
             wcsncpy(g_ini_path, path, MAX_PATH - 1);
+            g_ini_path[MAX_PATH - 1] = L'\0';   /* wcsncpy 不保证终止；勿依赖 static 零初始化 */
             return;
         }
     }
@@ -182,6 +183,7 @@ static void resolve_ini_path(void)
                 HUA_LOG_I("已在 AppData 创建默认配置");
         }
         wcsncpy(g_ini_path, path, MAX_PATH - 1);
+        g_ini_path[MAX_PATH - 1] = L'\0';
     }
 }
 
@@ -189,8 +191,19 @@ static void load_config(void)
 {
     resolve_ini_path();
 
-    char *text = g_ini_path[0] ? hua_read_file(g_ini_path) : NULL;
+    size_t raw_len = 0;
+    char *text = g_ini_path[0] ? hua_read_file(g_ini_path, &raw_len) : NULL;
     if (text) {
+        /*
+         * 含嵌入 NUL 几乎必然意味着 ini 被存成了 UTF-16（记事本「另存为 Unicode」）。
+         * inih 按 UTF-8 逐字节解析，会在第一个 NUL 处就结束 —— 结果是**静默**得到
+         * 零手势：用户发现手势全没了，日志却只有一条平静的「已加载 0 个手势」。
+         * 必须明确告诉他原因，否则无从排查。
+         */
+        if (raw_len != strlen(text))
+            HUA_LOG_W("配置疑似 UTF-16 编码（含嵌入 NUL），只能解析到前 %zu/%zu 字节，"
+                      "手势多半会全部失效；请将 hua.ini 另存为 UTF-8。",
+                      strlen(text), raw_len);
         config_parse_string(&g_config, text);   /* 内部先 set_defaults */
         hua_free(text);
         char *p8 = hua_utf16_to_utf8(g_ini_path);
@@ -214,11 +227,14 @@ static void load_config(void)
  */
 static bool watch_read_fingerprint(WatchFingerprint *out)
 {
-    char *text = hua_read_file(g_watch_path);
+    /* 必须按真实字节数算指纹，不能用 strlen：若 ini 被存成 UTF-16，其每个 ASCII
+     * 字符后都跟一个 \0，strlen 会在第一个字符处就截断，此后的任何改动都算不进
+     * 指纹里 —— 热加载会静默失效。 */
+    size_t size = 0;
+    char *text = hua_read_file(g_watch_path, &size);
     if (!text)
         return false;
 
-    size_t size = strlen(text);
     unsigned long long hash = 14695981039346656037ULL;  /* FNV-1a 64-bit */
     for (size_t i = 0; i < size; i++) {
         hash ^= (unsigned char)text[i];
@@ -275,7 +291,7 @@ static DWORD WINAPI watch_proc(LPVOID arg)
     return 0;
 }
 
-static void watch_stop(void);
+static bool watch_stop(void);
 
 /* 启动（或在 ini 路径变化后重启）配置监听。可重复调用：路径未变则原样返回。 */
 static void watch_start(void)
@@ -289,7 +305,11 @@ static void watch_start(void)
         if (wcscmp(g_watch_path, g_ini_path) == 0)
             return;
         HUA_LOG_I("配置路径已变化，重启监听");
-        watch_stop();
+        /* 旧线程没确认退出就不能重启：下面会覆写 g_watch_path 并把 g_watch_stop
+         * 清零，那等于复活旧线程的循环条件 —— 两个线程同时读写 g_watch_path /
+         * g_watch_fingerprint，还会重复投递重载。宁可维持现状。 */
+        if (!watch_stop())
+            return;
     }
     wcsncpy(g_watch_dir, g_ini_path, MAX_PATH - 1);
     g_watch_dir[MAX_PATH - 1] = L'\0';
@@ -306,34 +326,84 @@ static void watch_start(void)
                   GetLastError());
 }
 
-static void watch_stop(void)
+/* 停止监听线程。返回 true 表示已确认退出，可以安全重启；
+ * false 表示线程还活着，调用方绝不能复位 g_watch_stop 或覆写 g_watch_path。 */
+static bool watch_stop(void)
 {
-    if (g_watch_thread) {
-        InterlockedExchange(&g_watch_stop, 1);
-        WaitForSingleObject(g_watch_thread, 1000);
-        CloseHandle(g_watch_thread);
-        g_watch_thread = NULL;
+    if (!g_watch_thread)
+        return true;
+    InterlockedExchange(&g_watch_stop, 1);
+    /* 线程最长一轮 = WaitForSingleObject(300) + Sleep(150) + 读文件算指纹，
+     * 慢盘/网络盘上可能更久。等待超时就不能当它已经死了：此前的写法照样
+     * CloseHandle 并置 NULL，随后 watch_start 把 g_watch_stop 清零，等于把
+     * 旧线程的循环条件复活 → 双线程竞争 g_watch_path。 */
+    if (WaitForSingleObject(g_watch_thread, 5000) != WAIT_OBJECT_0) {
+        HUA_LOG_W("配置监听线程未能退出，维持现状（不重启监听）");
+        return false;   /* 句柄故意不关：线程仍在用它自己的状态 */
     }
+    CloseHandle(g_watch_thread);
+    g_watch_thread = NULL;
+    return true;
 }
 
 /* ---------------- 开机自启 ---------------- */
 
+/* s 是已跳过前导空白的行首。判定是否为 [General] 节头。 */
+static bool ini_line_is_general(const char *s)
+{
+    return _strnicmp(s, "[General]", 9) == 0;
+}
+
+/* 判定是否为 AutoStart 键行。整键匹配：只比前缀会把 AutoStartFoo=1 也改写掉。 */
+static bool ini_line_is_autostart(const char *s)
+{
+    if (_strnicmp(s, "AutoStart", 9) != 0)
+        return false;
+    const char *p = s + 9;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    return *p == '=';
+}
+
 /* 把 ini 里的 AutoStart 行写回为 enable（按行替换，尽量保留其余内容）。
  *
- * 写临时文件 + 原子替换，且检查每一次写入。绝不能像先前那样直接以 "wb" 打开原文件
- * ——那会立即截断它，此后任何失败（磁盘满、文件被占用、或 ini 被存成 UTF-16 导致
- * hua_read_file 的结果在首个 NUL 处被 strlen 截断）都会让用户的整份手势表永久丢失，
- * 而原内容此时只存在于内存里，没有任何备份。 */
+ * 写临时文件 + 原子替换，且检查每一次写入，绝不先截断原文件。但要注意：原子替换
+ * 只能防「写失败」，防不住「成功地写入了截断内容」——所以下面还必须先确认整份内容
+ * 都能被按 C 字符串安全遍历（见嵌入 NUL 的检查），否则照样会毁掉用户的配置。 */
 static void ini_write_autostart(bool enable)
 {
     if (!g_ini_path[0])
         return;
-    char *text = hua_read_file(g_ini_path);
+    size_t len = 0;
+    char *text = hua_read_file(g_ini_path, &len);
     if (!text)
         return;
 
+    /*
+     * 含嵌入 NUL（典型是被记事本「另存为 Unicode」存成了 UTF-16）：下面按 strchr/
+     * strlen 逐行遍历会在第一个 NUL 处就停下，于是「成功」写出一份只剩几个字节的
+     * 文件并原子替换掉原配置——用户整份手势表静默永久丢失。宁可不改。
+     */
+    if (len != strlen(text)) {
+        HUA_LOG_W("配置含嵌入 NUL（疑似 UTF-16 编码），拒绝改写以免丢失内容；"
+                  "请将 hua.ini 另存为 UTF-8。自启开关未写回文件。");
+        hua_free(text);
+        return;
+    }
+
+    /*
+     * 构造临时路径。必须检查 _snwprintf 的返回值：它截断时返回 -1 且不写终止符，
+     * 而 g_ini_path 最长可达 259 字符，此时拼上 ".tmp" 会被截回 259 —— 结果恰好
+     * **等于 g_ini_path 本身**，下面的 _wfopen(tmp, "wb") 就会直接截断用户的实时
+     * 配置，失败路径里的 _wremove(tmp) 更会把它整个删掉。
+     */
     wchar_t tmp[MAX_PATH];
-    _snwprintf(tmp, MAX_PATH, L"%s.tmp", g_ini_path);
+    int tn = _snwprintf(tmp, MAX_PATH, L"%s.tmp", g_ini_path);
+    if (tn < 0 || tn >= MAX_PATH) {
+        HUA_LOG_W("配置路径过长，无法构造临时文件（原配置未动）");
+        hua_free(text);
+        return;
+    }
     tmp[MAX_PATH - 1] = L'\0';
 
     FILE *fp = _wfopen(tmp, L"wb");
@@ -345,29 +415,71 @@ static void ini_write_autostart(bool enable)
 
     const char *val = enable ? "true" : "false";
     bool ok = true;
-    bool replaced = false;
+
+    /*
+     * 先扫一遍：[General] 里到底有没有 AutoStart 行。
+     * 必须带「节」的概念——AutoStart 只属于 [General]。若把它追加到文件末尾，
+     * 那里通常是最后一个 [App:xxx] 节（内置默认配置就以 [App:msedge.exe] 结尾），
+     * 于是这行会被解析成该程序的一条垃圾手势，开关永不生效；用户再点一次又追加
+     * 一行，ini 与垃圾手势逐次累积。
+     */
+    bool have_autostart = false;
+    {
+        bool in_gen = false;
+        char *l = text;
+        while (*l) {
+            char *e = strchr(l, '\n');
+            char *s = l;
+            while (*s == ' ' || *s == '\t')
+                s++;
+            if (*s == '[')
+                in_gen = ini_line_is_general(s);
+            else if (in_gen && ini_line_is_autostart(s)) {
+                have_autostart = true;
+                break;
+            }
+            if (!e)
+                break;
+            l = e + 1;
+        }
+    }
+
+    bool in_gen = false;
+    bool inserted = false;
     char *line = text;
     while (*line && ok) {
         char *eol = strchr(line, '\n');
-        size_t len = eol ? (size_t)(eol - line) : strlen(line);
+        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
         char *s = line;
         while (*s == ' ' || *s == '\t')
             s++;
-        if (!replaced && _strnicmp(s, "AutoStart", 9) == 0) {
-            ok = fprintf(fp, "AutoStart       = %s\r\n", val) > 0;
-            replaced = true;
+        bool is_hdr = (*s == '[');
+        if (is_hdr)
+            in_gen = ini_line_is_general(s);
+
+        if (in_gen && !is_hdr && have_autostart && ini_line_is_autostart(s)) {
+            ok = fprintf(fp, "AutoStart       = %s\r\n", val) > 0;   /* 就地替换 */
         } else {
-            if (len > 0 && fwrite(line, 1, len, fp) != len)   /* 含行尾 \r */
+            if (line_len > 0 && fwrite(line, 1, line_len, fp) != line_len)   /* 含行尾 \r */
                 ok = false;
             if (ok && eol && fputc('\n', fp) == EOF)
                 ok = false;
+            /* 原文件没有该键：紧跟在 [General] 头之后插入，而不是丢到文件末尾。 */
+            if (ok && is_hdr && in_gen && !have_autostart && !inserted) {
+                if (!eol && fputc('\n', fp) == EOF)   /* 头恰是最后一行且无换行 */
+                    ok = false;
+                if (ok)
+                    ok = fprintf(fp, "AutoStart       = %s\r\n", val) > 0;
+                inserted = true;
+            }
         }
         if (!eol)
             break;
         line = eol + 1;
     }
-    if (ok && !replaced)
-        ok = fprintf(fp, "AutoStart       = %s\r\n", val) > 0;
+    /* 整份 ini 连 [General] 节都没有：补一个完整的节，而非裸键追加到末尾。 */
+    if (ok && !have_autostart && !inserted)
+        ok = fprintf(fp, "\r\n[General]\r\nAutoStart       = %s\r\n", val) > 0;
 
     /* 缓冲数据要到 fclose 才真正落盘，这里的失败不能漏检。 */
     if (fclose(fp) != 0)
@@ -410,8 +522,14 @@ static void tray_free_icon(void)
 
 static void tray_add(HWND hwnd)
 {
-    /* 可能被 TaskbarCreated 重复调用：先释放上一轮的图标，否则每次重建泄漏一个。 */
-    tray_free_icon();
+    /* 本函数可能被 TaskbarCreated 重复调用。旧图标句柄要留到新注册建立之后再释放：
+     * 若此刻就销毁，而下面的 NIM_ADD 又失败（例如广播是多余的、图标其实还在），
+     * explorer 的旧注册仍引用着这个已销毁的 HICON，托盘图标会变成空白。 */
+    HICON old_icon  = g_nid.hIcon;
+    bool  old_owned = g_icon_owned;
+    g_nid.hIcon = NULL;
+    g_icon_owned = false;
+
     ZeroMemory(&g_nid, sizeof(g_nid));
     g_nid.cbSize           = sizeof(g_nid);
     g_nid.hWnd             = hwnd;
@@ -429,12 +547,21 @@ static void tray_add(HWND hwnd)
     wcscpy(g_nid.szTip, HUA_APP_NAME L"（划）\n"
                         HUA_DESCRIPTION L"\n"
                         L"v" HUA_VERSION);
+    /* 先清掉可能残留的同 (hWnd,uID) 注册再添加。资源管理器重启后托盘区是新建的、
+     * 旧记录本已随之消失，此调用会失败但无妨；而当广播是多余的（图标其实还在）时，
+     * 不先删就会让 NIM_ADD 因重复而失败。 */
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+
     /* 托盘是本程序唯一的 UI 入口，加不上图标 = 用户无法重载配置也无法退出。
      * 最常见的失败（开机自启早于资源管理器建好托盘区）由 TaskbarCreated 兜底重建，
      * 这里至少要留下日志，否则完全不可诊断。 */
     if (!Shell_NotifyIconW(NIM_ADD, &g_nid))
         HUA_LOG_W("添加托盘图标失败: %lu（若资源管理器尚未就绪，将在其广播后重建）",
                   GetLastError());
+
+    /* 新注册已建立（或已彻底失败），此时释放旧句柄才安全。 */
+    if (old_icon && old_owned)
+        DestroyIcon(old_icon);
 }
 
 static void tray_remove(void)
@@ -445,7 +572,9 @@ static void tray_remove(void)
 
 static void tray_show_menu(HWND hwnd)
 {
-    POINT pt;
+    /* 初始化后再取：GetCursorPos 会失败（切到非输入桌面时），失败时用未初始化的
+     * POINT 弹菜单等于读未初始化内存。项目其余三处 GetCursorPos 都判了返回值。 */
+    POINT pt = {0};
     GetCursorPos(&pt);
 
     HMENU menu = CreatePopupMenu();
@@ -489,8 +618,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     case WM_HUA_RELOAD:
         /* ini 文件变化：自动重载配置并按新触发键/阈值重装钩子。 */
         load_config();
-        apply_hook_config();
+        /* watch_start 在路径变化时会 watch_stop → WaitForSingleObject 阻塞最长 1s
+         * 且不泵消息，超过 LowLevelHooksTimeout 就会摘掉钩子。必须排在装钩子之前
+         * 跑完（同 WinMain 里 autostart_reconcile 的处理），否则弄死的正是刚装好的钩子。 */
         watch_start();   /* ini 路径可能已变，跟着换监听目标 */
+        apply_hook_config();
         HUA_LOG_I("检测到 ini 变化，已自动重载");
         return 0;
 
@@ -648,8 +780,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         switch (LOWORD(wParam)) {
         case IDM_RELOAD:
             load_config();
+            watch_start();   /* 同上：可能阻塞，必须在装钩子之前 */
             apply_hook_config();
-            watch_start();   /* ini 路径可能已变，跟着换监听目标 */
             HUA_LOG_I("菜单: 已重载配置");
             break;
         case IDM_OPEN_INI:
