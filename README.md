@@ -1,6 +1,6 @@
 # hua（划）· Windows 鼠标手势工具
 
-> **hua（划）** —— "划一下"即手势本身。纯 C17、无 GUI（仅托盘）、`.ini` 配置的 Windows 鼠标手势工具，复刻 MouseInc 的手势子集。
+> **hua（划）** —— "划一下"即手势本身。纯 C17、无 GUI（仅托盘）、`.ini` 配置的 Windows 鼠标手势工具。
 
 按住触发键（默认右键）拖动画出方向 → 识别 → 执行动作（发快捷键 / 运行程序 / 内置命令）。带实时轨迹浮层与动作名提示。
 
@@ -78,6 +78,16 @@ Enabled = false           ; 该程序禁用手势
 ```
 
 动作前缀：`key:ctrl+shift+t`（快捷键）、`run:C:\tools\a.exe`（运行/打开）、`cmd:close_window`（内置命令）。
+
+**`cmd:none` = 显式无动作**，用于在 per-app 中屏蔽某个全局手势（不会回落到全局映射），浮层照常提示「手势无动作」：
+
+```ini
+[Gestures]
+39 = key:f5               ; 全局：V 形刷新
+
+[App:powerpnt.exe]
+39 = cmd:none             ; 但 PPT 里屏蔽它（F5 在 PPT 是放映）
+```
 
 内置命令：`close_window` `minimize` `maximize` `restore` `toggle_maximize` `scroll_top` `scroll_bottom` `volume_up` `volume_down` `volume_mute` `media_play` `copy` `paste` `open_exe_dir`（打开当前程序所在目录）。
 
