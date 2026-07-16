@@ -4,6 +4,7 @@
 #include "action.h"
 #include "platform.h"
 
+#include <assert.h>
 #include <string.h>
 #include <ctype.h>
 #include <stdlib.h>
@@ -100,6 +101,12 @@ bool action_parse_key(const char *spec, KeyCombo *out)
 
 /* ---------------- 键盘合成 ---------------- */
 
+#define KEY_MODIFIER_COUNT 4                          /* ctrl / alt / shift / win */
+#define KEY_INPUT_MAX (KEY_MODIFIER_COUNT * 2 + 2)    /* 修饰键各按下+抬起，加主键按下+抬起 */
+/* 缓冲容量是按最坏组合精确算出来的，push_key 本身不做边界检查。把这个隐式不变量
+ * 固化成编译期断言：将来若加第五个修饰键，这里会立刻编译失败，而不是栈溢出。 */
+static_assert(KEY_INPUT_MAX >= 10, "INPUT 缓冲必须容纳全修饰键组合");
+
 static void push_key(INPUT *arr, int *n, WORD vk, bool up)
 {
     INPUT e;
@@ -112,7 +119,7 @@ static void push_key(INPUT *arr, int *n, WORD vk, bool up)
 
 static bool send_key(const KeyCombo *k)
 {
-    INPUT in[10];
+    INPUT in[KEY_INPUT_MAX];
     int n = 0;
     if (k->ctrl)  push_key(in, &n, VK_CONTROL, false);
     if (k->alt)   push_key(in, &n, VK_MENU,    false);
@@ -126,7 +133,24 @@ static bool send_key(const KeyCombo *k)
     if (k->ctrl)  push_key(in, &n, VK_CONTROL, true);
 
     UINT sent = SendInput((UINT)n, in, sizeof(INPUT));
-    return sent == (UINT)n;
+    if (sent == (UINT)n)
+        return true;
+
+    /*
+     * 部分注入：序列是「修饰键↓ … 修饰键↑」，若在修饰键按下之后中断，该修饰键会
+     * 全系统卡在按下状态——此后用户的每次点击都变成 Ctrl+Click，且必须手动敲一下
+     * 该键才能解除。故补发一次修饰键释放；对未按下的键补 KEYUP 是无害的。
+     */
+    INPUT rel[KEY_MODIFIER_COUNT];
+    int m = 0;
+    if (k->ctrl)  push_key(rel, &m, VK_CONTROL, true);
+    if (k->alt)   push_key(rel, &m, VK_MENU,    true);
+    if (k->shift) push_key(rel, &m, VK_SHIFT,   true);
+    if (k->win)   push_key(rel, &m, VK_LWIN,    true);
+    if (m > 0)
+        SendInput((UINT)m, rel, sizeof(INPUT));
+    HUA_LOG_W("SendInput 仅注入 %u/%d 个事件，已补发修饰键释放", sent, n);
+    return false;
 }
 
 /*

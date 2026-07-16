@@ -202,6 +202,11 @@ static void draw_trail(const Pt *pts, size_t n)
             acc += seg;
         }
         first = i;
+        /* 至少保留最后一段：单段本身就超过上限时（鼠标极快跳变可产生这种长段），
+         * 上面的循环会在第一次迭代就 break 并让 first == m-1，count 退化为 1，
+         * 于是整帧不画轨迹、画面闪断。保底留两个点，宁可略微超过长度上限。 */
+        if (first > m - 2)
+            first = m - 2;
     }
     size_t count = m - first;
     if (count < 2)
@@ -551,6 +556,10 @@ void overlay_update(const Pt *pts, size_t n, const char *seq, const char *action
 
 void overlay_end(void)
 {
+    /* 淡出计时器挂在轨迹层窗口上；没有它就没法 KillTimer，
+     * SetTimer(NULL,...) 会创建一个杀不掉的线程计时器，每次调用泄漏一个。 */
+    if (!g_trail_layer.hwnd)
+        return;
     if (!g_trail_layer.shown && !g_osd_layer.shown)
         return;
     g_fade = 255;

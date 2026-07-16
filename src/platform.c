@@ -3,6 +3,12 @@
  */
 #include "platform.h"
 
+/* INITGUID 让 FOLDERID_* 的 GUID 在本 TU 内实体化，免去链接 uuid.lib。 */
+#define INITGUID
+#include <initguid.h>
+#include <knownfolders.h>
+#include <shlobj.h>
+
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -37,12 +43,15 @@ void hua_log_init(void)
     /* 二进制追加：直接写 UTF-8 字节（源码/字面量已是 UTF-8），不走 CRT 的
      * Unicode 翻译层——ccs=UTF-8 会把流设成宽字符模式，narrow fprintf 会失效。
      * 失败也不致命，后续 hua_logf 会静默跳过。 */
+    /* _snwprintf 截断时返回 -1 且不写终止符，必须手动补（与 hua_appdata_dir 一致）。 */
     if (hua_exe_dir(dir, MAX_PATH)) {
         _snwprintf(path, MAX_PATH, L"%shua.log", dir);
+        path[MAX_PATH - 1] = L'\0';
         g_log_fp = _wfopen(path, L"ab");
     }
     if (!g_log_fp && hua_appdata_dir(dir, MAX_PATH)) {
         _snwprintf(path, MAX_PATH, L"%shua.log", dir);
+        path[MAX_PATH - 1] = L'\0';
         g_log_fp = _wfopen(path, L"ab");
     }
     if (g_log_fp) {
@@ -159,10 +168,28 @@ bool hua_appdata_dir(wchar_t *out, size_t cap)
 {
     if (!out || cap == 0)
         return false;
+
+    /*
+     * 用 SHGetKnownFolderPath 而非 %APPDATA% 环境变量：本程序经 UAC 提权启动时会
+     * 继承请求方的环境块，中完整性的攻击者可用改过 APPDATA 的环境拉起 hua，把配置
+     * 与日志重定向到自己控制的目录——而配置里的 run: 动作是以管理员权限执行的。
+     * KnownFolder 走的是注册表/令牌，不受环境变量摆布。
+     */
     wchar_t base[MAX_PATH];
-    DWORD n = GetEnvironmentVariableW(L"APPDATA", base, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH)
+    PWSTR known = NULL;
+    if (FAILED(SHGetKnownFolderPath(&FOLDERID_RoamingAppData, 0, NULL, &known)) || !known) {
+        if (known)
+            CoTaskMemFree(known);
         return false;
+    }
+    size_t klen = wcslen(known);
+    if (klen == 0 || klen >= MAX_PATH) {
+        CoTaskMemFree(known);
+        return false;
+    }
+    wcsncpy(base, known, MAX_PATH - 1);
+    base[MAX_PATH - 1] = L'\0';
+    CoTaskMemFree(known);
 
     /* 先确保 %APPDATA%\hua 存在（不含末尾反斜杠给 CreateDirectory）。 */
     wchar_t dir[MAX_PATH];
@@ -187,8 +214,10 @@ bool hua_write_file(const wchar_t *path, const void *data, size_t len)
     if (!fp)
         return false;
     size_t wr = fwrite(data, 1, len, fp);
-    fclose(fp);
-    return wr == len;
+    /* 缓冲数据要到 fclose 才真正落盘（磁盘满等失败在这里才暴露），
+     * 漏检它会把失败误报成成功。 */
+    bool closed = (fclose(fp) == 0);
+    return wr == len && closed;
 }
 
 char *hua_read_file(const wchar_t *path)
