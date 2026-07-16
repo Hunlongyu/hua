@@ -220,8 +220,10 @@ bool hua_write_file(const wchar_t *path, const void *data, size_t len)
     return wr == len && closed;
 }
 
-char *hua_read_file(const wchar_t *path)
+char *hua_read_file(const wchar_t *path, size_t *out_len)
 {
+    if (out_len)
+        *out_len = 0;
     FILE *fp = _wfopen(path, L"rb");
     if (!fp)
         return NULL;
@@ -237,8 +239,11 @@ char *hua_read_file(const wchar_t *path)
         fclose(fp);
         return NULL;
     }
+    /* 用实际读取数而非 sz 终止：短读（文件被并发截断 / IO 错误）时不暴露未初始化字节。 */
     size_t rd = fread(buf, 1, (size_t)sz, fp);
     buf[rd] = '\0';
     fclose(fp);
+    if (out_len)
+        *out_len = rd;
     return buf;
 }

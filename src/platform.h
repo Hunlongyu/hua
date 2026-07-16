@@ -42,8 +42,13 @@ bool hua_exe_dir(wchar_t *out, size_t cap);
 bool hua_appdata_dir(wchar_t *out, size_t cap);
 
 /* 读取整个文件为堆分配的 NUL 结尾字节缓冲（原样 UTF-8 字节）。
- * 调用方用 hua_free 释放；失败（文件不存在等）返回 NULL。 */
-char *hua_read_file(const wchar_t *path);
+ * 调用方用 hua_free 释放；失败（文件不存在等）返回 NULL。
+ *
+ * out_len 非 NULL 时写入实际读取的字节数。**要改写文件内容的调用方必须用它**：
+ * 仅凭 NUL 结尾无法区分「文本到此结束」与「文件含嵌入 NUL」（如被存成 UTF-16 的
+ * ini，其每个 ASCII 字符后都跟一个 \0）——后者用 strlen 遍历会在第一个字符处就
+ * 截断，若据此回写就会把用户的文件truncate 掉。 */
+char *hua_read_file(const wchar_t *path, size_t *out_len);
 
 /* 判断文件是否存在。 */
 bool hua_file_exists(const wchar_t *path);
