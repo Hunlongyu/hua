@@ -52,6 +52,82 @@ UTEST(config, parse_mouseinc_items)
     ASSERT_FALSE(c.restore_event);
 }
 
+UTEST(config, clamps_out_of_range_values)
+{
+    Config c;
+    /* ini 是不可信输入：超大值会导致平方后有符号溢出（long 在 Windows 是 32 位），
+     * 且 Tolerance 过大会让任何甩动都匹配上模板并真的执行动作。 */
+    config_parse_string(&c,
+        "[General]\n"
+        "Tolerance=999\n"
+        "MinDistance=2000000000\n"
+        "StepDistance=2000000000\n"
+        "TriggerDistance=2000000000\n"
+        "TrailWidth=2000000000\n"
+        "TextSize=2000000000\n"
+        "TextOutlineWidth=999999\n"
+        "TextLetterSpacing=999999\n");
+    ASSERT_EQ(c.tolerance, CFG_MAX_TOLERANCE);
+    ASSERT_EQ(c.min_distance, 10000);
+    ASSERT_EQ(c.step_distance, 10000);
+    ASSERT_EQ(c.trigger_distance, 10000);
+    ASSERT_EQ(c.trail_width, 200);
+    ASSERT_EQ(c.text_size, 500);
+    ASSERT_EQ(c.text_outline_width, 100);
+    ASSERT_EQ(c.text_letter_spacing, 500);
+}
+
+UTEST(config, invalid_positive_fields_fall_back_to_defaults)
+{
+    Config c;
+    /* 非正值（含 atoi 对垃圾输入返回的 0）必须回落到**文档默认值**，而不是区间下界。
+     * 若夹成 1，MinDistance=1 会让每次像素抖动都成为一个方向段 → 所有手势失效。 */
+    config_parse_string(&c,
+        "[General]\n"
+        "MinDistance=0\n"
+        "StepDistance=-5\n"
+        "TriggerDistance=-1\n"
+        "TrailWidth=0\n"
+        "TextSize=-100\n");
+    ASSERT_EQ(c.min_distance, 20);
+    ASSERT_EQ(c.step_distance, 12);
+    ASSERT_EQ(c.trigger_distance, 5);
+    ASSERT_EQ(c.trail_width, 3);
+    ASSERT_EQ(c.text_size, 26);
+}
+
+UTEST(config, garbage_text_falls_back_to_defaults)
+{
+    Config c;
+    /* atoi 对非数字返回 0。中文用户误填中文数字并不罕见。 */
+    config_parse_string(&c,
+        "[General]\n"
+        "MinDistance=二十\n"
+        "StepDistance=auto\n"
+        "TextSize=O\n"
+        "TrailWidth=\n");
+    ASSERT_EQ(c.min_distance, 20);
+    ASSERT_EQ(c.step_distance, 12);
+    ASSERT_EQ(c.text_size, 26);
+    ASSERT_EQ(c.trail_width, 3);
+}
+
+UTEST(config, zero_is_meaningful_for_some_fields)
+{
+    Config c;
+    /* 这些字段的 0 是合法语义，不能被回落掉。 */
+    config_parse_string(&c,
+        "[General]\n"
+        "Tolerance=0\n"
+        "TrailMaxLength=0\n"
+        "TextOutlineWidth=0\n"
+        "TextLetterSpacing=0\n");
+    ASSERT_EQ(c.tolerance, 0);
+    ASSERT_EQ(c.trail_max_length, 0);
+    ASSERT_EQ(c.text_outline_width, 0);
+    ASSERT_EQ(c.text_letter_spacing, 0);
+}
+
 UTEST(config, parse_general_fields)
 {
     Config c;
@@ -274,8 +350,17 @@ UTEST(resolve, tolerance_fuzzy)
 {
     Config c;
     config_parse_string(&c, "[General]\nTolerance=1\n[Gestures]\n26=cmd:close_window\n");
-    /* 画成 "266"，编辑距离 1，容错命中 */
+    /* 画成 "266"，编辑距离 1 < 模板长度 2，容错命中 */
     ASSERT_STREQ(config_resolve(&c, "notepad.exe", "266"), "cmd:close_window");
+}
+
+UTEST(resolve, tolerance_is_clamped_to_sane_upper_bound)
+{
+    Config c;
+    /* Tolerance 仍是用户主动开启的模糊匹配（默认 0 = 精确），这里只保证
+     * 荒谬的值被夹到有意义的上界，不改变容错本身的语义。 */
+    config_parse_string(&c, "[General]\nTolerance=99\n[Gestures]\n26=cmd:close_window\n");
+    ASSERT_EQ(c.tolerance, CFG_MAX_TOLERANCE);
 }
 
 UTEST_MAIN();

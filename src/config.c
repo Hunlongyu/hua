@@ -184,10 +184,53 @@ static int handler(void *user, const char *section, const char *name,
     return 1;   /* 未知节：忽略但不报错 */
 }
 
+static int clamp_int(int v, int lo, int hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/*
+ * 用于「必须为正」的字段：非正值（含 atoi 对垃圾输入返回的 0）回落到**文档默认值**，
+ * 而不是区间下界。区别很关键：`MinDistance = 二十` 时 atoi 得 0，回落到 20 才能继续
+ * 正常工作；若夹成下界 1，则每次像素抖动都会被切成一个方向段，所有手势都将失效。
+ */
+static int fallback_clamp(int v, int def, int lo, int hi)
+{
+    if (v <= 0)
+        return def;
+    return clamp_int(v, lo, hi);
+}
+
+/*
+ * 校正 ini 数值到合理区间。ini 全是不可信输入：atoi 对垃圾输入返回 0，对超长
+ * 数字是 UB。不校验会导致有符号溢出（MinDistance 等会被平方，而 long 在 Windows
+ * 恒为 32 位）与荒谬的浮层布局算术。
+ */
+static void config_clamp(Config *c)
+{
+    /* 必须为正的字段：非法/缺失 → 文档默认值（与 config_set_defaults 保持一致）。 */
+    c->trigger_distance = fallback_clamp(c->trigger_distance, 5,  1, 10000);
+    c->min_distance     = fallback_clamp(c->min_distance,     20, 1, 10000);
+    c->step_distance    = fallback_clamp(c->step_distance,    12, 1, 10000);
+    c->trail_width      = fallback_clamp(c->trail_width,      3,  1, 200);
+    c->text_size        = fallback_clamp(c->text_size,        26, 1, 500);
+
+    /* 0 是合法语义的字段：tolerance=0 精确匹配、trail_max_length=0 不限、
+     * text_outline_width=0 不描边、pause_timeout=0 不超时。故只夹不回落。 */
+    c->tolerance           = clamp_int(c->tolerance,           0, CFG_MAX_TOLERANCE);
+    c->pause_timeout       = clamp_int(c->pause_timeout,       0, 600000);
+    c->trail_max_length    = clamp_int(c->trail_max_length,    0, 1000000);
+    c->text_outline_width  = clamp_int(c->text_outline_width,  0, 100);
+    c->text_letter_spacing = clamp_int(c->text_letter_spacing, 0, 500);
+    /* 负值有意义：把 OSD 放到该屏底边以下（上下堆叠的多屏布局）。 */
+    c->text_position       = clamp_int(c->text_position,   -10000, 10000);
+}
+
 bool config_parse_string(Config *c, const char *text)
 {
     config_set_defaults(c);
     int r = ini_parse_string(text, handler, c);
+    config_clamp(c);
     /* r>0 = 某行解析错（坏行已跳过）；-2 = 内存不足。除内存外都视为成功。 */
     return r != -2;
 }

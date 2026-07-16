@@ -23,6 +23,10 @@ typedef enum {
 
 #define CFG_MAX_KEY          16
 #define CFG_MAX_ACTION       256
+/* Tolerance 上界。实际手势模板都是 1~4 个方向，容错再大只会让任意手势都命中最短
+ * 模板。注意：容错本身是用户主动开启的模糊匹配（默认 0 = 精确匹配，刻意如此以消除
+ * "2" vs "26" 的前缀歧义），开启后的误命中属已知取舍，此上界只挡荒谬值。 */
+#define CFG_MAX_TOLERANCE    4
 #define CFG_MAX_GESTURES     128
 #define CFG_MAX_APPS         64
 #define CFG_MAX_APP_GESTURES 64
