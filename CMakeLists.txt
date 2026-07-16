@@ -18,6 +18,14 @@ if(MSVC)
   add_compile_options(/utf-8)
 endif()
 
+# hua.rc 同为 UTF-8，但 RC 编译器不吃上面的 /utf-8：它默认按系统代码页（如 GBK）
+# 解析 .rc，会把 VERSIONINFO 里的中文变成乱码。故显式指定代码页 65001。
+if(MSVC)
+  string(APPEND CMAKE_RC_FLAGS " /c65001")
+else()
+  string(APPEND CMAKE_RC_FLAGS " --codepage=65001")
+endif()
+
 # -------- 纯逻辑静态库（主程序与测试共用，零 Win32 依赖）--------
 # inih（third_party/ini.c）作为源码内联编入，无运行时 DLL 依赖。
 add_library(hua_core STATIC

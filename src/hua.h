@@ -7,7 +7,12 @@
 
 #include <windows.h>
 
+#include "version.h"
+
 #define HUA_APP_NAME      L"hua"
+/* 由 version.h 的数字推导；窄串与宽串拼接后整体为宽串（C11 起有定义）。 */
+#define HUA_VERSION       L"" HUA_VERSION_STR
+#define HUA_DESCRIPTION   L"Windows 鼠标手势工具"
 #define HUA_PROJECT_URL   L"https://github.com/Hunlongyu/hua"
 #define HUA_WINDOW_CLASS  L"HuaMessageWindow"
 /* 单实例互斥量名。Local\ 前缀 = 每用户会话内唯一即可。 */

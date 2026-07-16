@@ -347,7 +347,10 @@ static void tray_add(HWND hwnd)
                                     GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
     if (!g_nid.hIcon)
         g_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
-    wcscpy(g_nid.szTip, L"hua · 鼠标手势");
+    /* 悬浮提示三行：名称 / 简介 / 版本。szTip 为 128 WCHAR，\n 换行。 */
+    wcscpy(g_nid.szTip, HUA_APP_NAME L"（划）\n"
+                        HUA_DESCRIPTION L"\n"
+                        L"v" HUA_VERSION);
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 

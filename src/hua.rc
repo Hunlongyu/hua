@@ -1,9 +1,46 @@
-/* 资源脚本：应用清单 + 应用图标。
- * CREATEPROCESS_MANIFEST_RESOURCE_ID(1) + RT_MANIFEST(24) 由 winuser.h 提供。 */
+/* 资源脚本：应用清单 + 应用图标 + 版本信息。
+ * CREATEPROCESS_MANIFEST_RESOURCE_ID(1) + RT_MANIFEST(24) 由 winuser.h 提供；
+ * VERSIONINFO 相关常量由 winver.h 提供。 */
 #include <winuser.h>
+#include <winver.h>
 #include "resource.h"
+#include "version.h"
 
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
 
 /* 多尺寸图标（16/32/48/256），窗口类与托盘共用。路径相对本 .rc 文件。 */
 IDI_APP ICON "../assets/app.ico"
+
+/* 文件属性 → 详细信息。版本号取自 version.h，勿在此处硬编码。 */
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    HUA_VER_MAJOR,HUA_VER_MINOR,HUA_VER_PATCH,0
+ PRODUCTVERSION HUA_VER_MAJOR,HUA_VER_MINOR,HUA_VER_PATCH,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS      VS_FF_DEBUG
+#else
+ FILEFLAGS      0x0L
+#endif
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"   /* 简体中文(0x804) + Unicode(1200) */
+        BEGIN
+            VALUE "CompanyName",      "Hunlongyu"
+            VALUE "FileDescription",  "Windows 鼠标手势工具"
+            VALUE "FileVersion",      HUA_VERSION_STR
+            VALUE "InternalName",     "hua"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 Hunlongyu"
+            VALUE "OriginalFilename", "hua.exe"
+            VALUE "ProductName",      "hua"
+            VALUE "ProductVersion",   HUA_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
