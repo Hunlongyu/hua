@@ -36,6 +36,14 @@ bool hook_install(HWND notify_hwnd, HuaTrigger trigger,
                   int trigger_dist, int min_dist, int step_dist);
 void hook_uninstall(void);
 
+/* 钩子探活（启发式：光标动过但钩子无事件 → 已被系统静默摘掉）。
+ * 需由主线程定期调用；返回 true 表示应当（重）安装钩子。
+ * 未安装（含安装失败）时也返回 true。连续两周期可疑才判定，以滤除安全桌面误判。 */
+bool hook_looks_dead(void);
+
+/* 状态机是否空闲（无手势进行中）。用于避免在手势中途重装钩子。 */
+bool hook_is_idle(void);
+
 /* 供主线程在收到 GESTURE_END 后读取：最近一次识别的方向串与锁定的目标窗口。 */
 const char *hook_last_seq(void);
 HWND        hook_last_target(void);

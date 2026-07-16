@@ -3,6 +3,7 @@
  */
 #include "hook.h"
 #include "hua.h"
+#include "platform.h"
 #include "recognizer.h"
 
 #include <string.h>
@@ -21,6 +22,11 @@ static int        g_step_dist = 12;      /* 采点去抖 */
 static HookGateFn g_gate;
 static HookState  g_state;
 static ULONGLONG  g_last_input_tick;
+/* 探活用：最近一次回调时间，与上次探活时的光标位置/时刻。 */
+static ULONGLONG  g_last_cb_tick;
+static Pt         g_wd_pos;
+static ULONGLONG  g_wd_tick;
+static int        g_suspect;   /* 连续可疑周期数，达 2 才判定失效（滤误判） */
 static bool       g_suppress_trigger_up;
 static Pt         g_pts[HOOK_MAX_PTS];
 static size_t     g_npts;
@@ -28,7 +34,7 @@ static Pt         g_start;
 static Pt         g_last_pos;
 static HWND       g_target;
 static HWND       g_foreground_at_down;
-static char       g_seq[64];   /* 最近识别到的方向串 */
+static char       g_seq[REC_MAX_SEQ];   /* 最近识别到的方向串 */
 
 /* ---------------- 触发键判定 ---------------- */
 
@@ -77,14 +83,17 @@ static void track_point(Pt p)
         g_last_input_tick = GetTickCount64();
     }
 
+    /* 用 64 位做平方：long 在 Windows（LLP64）恒为 32 位，坐标差的平方和在超宽
+     * 虚拟桌面上可能溢出（有符号溢出是 UB）。阈值侧已由 config_clamp 挡住，
+     * 但坐标侧取决于光标位置，不受配置约束。 */
     Pt last = g_pts[g_npts - 1];
-    long dx = p.x - last.x, dy = p.y - last.y;
-    if (dx * dx + dy * dy >= (long)g_step_dist * g_step_dist)
+    long long dx = p.x - last.x, dy = p.y - last.y;
+    if (dx * dx + dy * dy >= (long long)g_step_dist * g_step_dist)
         add_point(p);
 
     if (g_state == ST_TENTATIVE) {
-        long sx = p.x - g_start.x, sy = p.y - g_start.y;
-        if (sx * sx + sy * sy >= (long)g_trigger_dist * g_trigger_dist)
+        long long sx = p.x - g_start.x, sy = p.y - g_start.y;
+        if (sx * sx + sy * sy >= (long long)g_trigger_dist * g_trigger_dist)
             g_state = ST_ACTIVE;
     }
 }
@@ -111,7 +120,13 @@ static void synth_click(HuaTrigger t)
     in[1].mi.dwFlags = up;
     in[1].mi.mouseData = data;
     in[1].mi.dwExtraInfo = HUA_SIGNATURE;
-    SendInput(2, in, sizeof(INPUT));
+    UINT sent = SendInput(2, in, sizeof(INPUT));
+    if (sent != 2) {
+        /* 只注入了 Down 会让目标程序认为触发键一直按着。补发 Up 收拾干净。 */
+        if (sent == 1)
+            SendInput(1, &in[1], sizeof(INPUT));
+        HUA_LOG_W("补发触发键点击失败：仅注入 %u/2 个事件", sent);
+    }
 }
 
 /* ---------------- 事件处理 ---------------- */
@@ -193,6 +208,7 @@ static LRESULT handle_event(WPARAM msg, const MSLLHOOKSTRUCT *ms)
 static LRESULT CALLBACK low_level_mouse_proc(int nCode, WPARAM wParam, LPARAM lParam)
 {
     if (nCode == HC_ACTION) {
+        g_last_cb_tick = GetTickCount64();   /* 探活心跳：证明钩子仍在派发 */
         const MSLLHOOKSTRUCT *ms = (const MSLLHOOKSTRUCT *)lParam;
         /* 放行自身补发的合成事件（LLMHF_INJECTED + 签名），不参与状态机。 */
         bool self = (ms->flags & LLMHF_INJECTED) && (ms->dwExtraInfo == HUA_SIGNATURE);
@@ -233,6 +249,60 @@ void hook_uninstall(void)
     g_notify = NULL;
     g_state  = ST_IDLE;
     g_suppress_trigger_up = false;
+    /* 必须一并清空采样点：否则重装后主线程若仍在跑 TIMER_FRAME，
+     * hook_snapshot() 会返回上一轮的陈旧轨迹，浮层会把它永久画在屏幕上。 */
+    g_npts   = 0;
+}
+
+bool hook_is_idle(void) { return g_state == ST_IDLE; }
+
+/*
+ * 钩子探活。系统在回调超时后会静默摘钩且不通知，g_hook 仍是陈旧的非空句柄，
+ * 而 Win32 没有「查询钩子是否还在」的 API。故用启发式：若上个探活周期内光标
+ * 明显移动过，钩子却一个事件都没收到，即判定已被摘。
+ * 返回 true 表示需要（重）安装。
+ */
+bool hook_looks_dead(void)
+{
+    /* 没装上也要报告为「需要装」：hook_install 失败会让 g_hook 停在 NULL，
+     * 若此处返回 false，watchdog 就在最需要它的场景（安装失败）里永久失能。 */
+    if (!g_hook)
+        return true;
+
+    POINT p;
+    ULONGLONG now = GetTickCount64();
+    if (!GetCursorPos(&p)) {
+        /* 拿不到光标就不臆断，但仍要推进基线时刻，
+         * 否则下个周期会拿一个过期的 g_wd_tick 去比较。 */
+        g_wd_tick = now;
+        g_suspect = 0;
+        return false;
+    }
+
+    bool moved = (p.x != g_wd_pos.x || p.y != g_wd_pos.y);
+    /* 上个周期内有移动，但最近一次回调早于上次探活时刻 → 事件没进来 */
+    bool suspect = moved && g_wd_tick != 0 && g_last_cb_tick < g_wd_tick;
+
+    g_wd_pos.x = (int)p.x;
+    g_wd_pos.y = (int)p.y;
+    g_wd_tick  = now;
+
+    /*
+     * 单周期就下结论会误判：安全桌面（UAC 同意框、锁屏、Ctrl+Alt+Del）期间
+     * 鼠标事件不派发到我们的钩子，但 GetCursorPos 读的是全局光标位置、照样在变；
+     * SetCursorPos 类工具（mouse jiggler 等）移动光标也不产生鼠标事件。
+     * 故要求连续两个周期都可疑才判定，代价是恢复延迟 3s→6s，远优于误重装
+     * （误重装若撞上进行中的手势，会清掉 g_suppress_trigger_up 导致孤儿 Up 泄漏）。
+     */
+    if (!suspect) {
+        g_suspect = 0;
+        return false;
+    }
+    g_suspect++;
+    if (g_suspect < 2)
+        return false;
+    g_suspect = 0;
+    return true;
 }
 
 const char *hook_last_seq(void)   { return g_seq; }
@@ -258,7 +328,14 @@ size_t hook_snapshot(const Pt **out)
 
 bool hook_cancel_if_timed_out(DWORD timeout_ms, HookTimeoutInfo *info)
 {
-    if (g_state != ST_ACTIVE || timeout_ms == 0)
+    /*
+     * ST_TENTATIVE 也必须纳入超时兜底。它是「Down 已吞、位移还没到 TriggerDistance」
+     * 的窗口期：若此时输入被切走且我们收不到 Up（UAC 安全桌面、Win+L 锁屏、
+     * Ctrl+Alt+Del、RDP 切换，或被更前面的钩子吃掉），状态会永久卡在 TENTATIVE，
+     * TIMER_FRAME 空转不停；等用户回来随手动一下鼠标，位移超过阈值就会转入
+     * ST_ACTIVE —— 于是一条没人按键的「幽灵轨迹」跟着光标跑，还会弹出动作名。
+     */
+    if ((g_state != ST_ACTIVE && g_state != ST_TENTATIVE) || timeout_ms == 0)
         return false;
 
     ULONGLONG elapsed = GetTickCount64() - g_last_input_tick;
