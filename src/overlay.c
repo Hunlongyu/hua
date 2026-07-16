@@ -47,11 +47,18 @@ static int       g_trail_max_len = 2500;   /* 轨迹绘制长度上限（px，0=
 static unsigned  g_text_fill = 0xFFFFFF;   /* OSD 文字镂空填充色 */
 static int       g_text_outline = 3;       /* OSD 文字描边宽度（px） */
 static int       g_text_spacing = 4;       /* OSD 文字字间距（px） */
+/* 上面几个尺寸量是**逻辑像素**（96 DPI 基准）；下面这组是按手势所在屏 DPI 换算出的
+ * 物理像素，由 refresh_scaled_metrics 每帧刷新。所有绘制只用这组。 */
+static UINT      g_mon_dpi = 96;
+static int       g_px_trail_width = 3, g_px_text_size = 26, g_px_text_pos = 150;
+static int       g_px_text_outline = 3, g_px_text_spacing = 4;
 static unsigned  g_cur_color;   /* 本次手势用色 */
 static int       g_color_idx;
 
 /* 绘制点缓冲（图层局部坐标） */
 static GpPoint   g_gp[MAX_DRAW_PTS];
+
+static void refresh_scaled_metrics(void);
 
 /* ---------------- 图层：表面按需分配 / 呈现 / 释放 ---------------- */
 
@@ -168,7 +175,7 @@ static void draw_arrow(GpGraphics *g, ARGB color, GpPoint base, GpPoint tip)
 /* 起点用独立实心圆标记，不依赖线帽在不同 GDI+ 实现下的视觉效果。 */
 static void draw_start_dot(GpGraphics *g, ARGB color, GpPoint center)
 {
-    INT diameter = g_trail_width * 2 + 2;
+    INT diameter = g_px_trail_width * 2 + 2;
     INT radius = diameter / 2;
     GpBrush *br = NULL;
     if (GdipCreateSolidFill(color, &br) == 0 && br) {
@@ -221,7 +228,7 @@ static void draw_trail(const Pt *pts, size_t n)
         if (pts[i].y < miny) miny = pts[i].y;
         if (pts[i].y > maxy) maxy = pts[i].y;
     }
-    int margin = g_trail_width * 3 + 12;
+    int margin = g_px_trail_width * 3 + 12;
     int lx = minx - margin, ly = miny - margin;
     int lw = (maxx - minx) + margin * 2, lh = (maxy - miny) + margin * 2;
     if (!layer_ensure(&g_trail_layer, lx, ly, lw, lh))
@@ -251,7 +258,7 @@ static void draw_trail(const Pt *pts, size_t n)
     GpPoint base = tip;
     size_t line_count = m;
     if (arrow) {
-        double wanted = g_trail_width * 3.0 + 8.0;
+        double wanted = g_px_trail_width * 3.0 + 8.0;
         size_t anchor = m - 2;
         double dx = 0.0, dy = 0.0, len = 0.0;
         for (;;) {
@@ -276,7 +283,7 @@ static void draw_trail(const Pt *pts, size_t n)
     }
 
     GpPen *pen = NULL;
-    if (GdipCreatePen1(color, (REAL)g_trail_width, UnitPixel, &pen) == 0 && pen) {
+    if (GdipCreatePen1(color, (REAL)g_px_trail_width, UnitPixel, &pen) == 0 && pen) {
         GdipSetPenStartCap(pen, LineCapRound);
         GdipSetPenEndCap(pen, arrow ? 0 /*平头*/ : LineCapRound);
         GdipSetPenLineJoin(pen, LineJoinRound);
@@ -320,33 +327,33 @@ static void draw_osd(const wchar_t *text, bool failed)
     REAL adv[OSD_MAX_GLYPHS];
     REAL total = 0.0f;
     for (int i = 0; i < glyphs; i++) {
-        REAL w = (REAL)g_text_size;   /* 兜底 */
+        REAL w = (REAL)g_px_text_size;   /* 兜底 */
         GpPath *tmp = NULL;
         if (GdipCreatePath(FillModeAlternate, &tmp) == 0 && tmp) {
             RectF probe = { 0.0f, 0.0f, 10000.0f, 10000.0f };
             RectF b;
             if (GdipAddPathString(tmp, &text[i], 1, fam, FontStyleRegular,
-                                  (REAL)g_text_size, &probe, fmt) == 0 &&
+                                  (REAL)g_px_text_size, &probe, fmt) == 0 &&
                 GdipGetPathWorldBounds(tmp, &b, NULL, NULL) == 0)
                 w = b.Width;
             GdipDeletePath(tmp);
         }
         if (w < 1.0f)                 /* 空格等无墨迹字形：给个近似宽度 */
-            w = (REAL)g_text_size * 0.3f;
+            w = (REAL)g_px_text_size * 0.3f;
         adv[i] = w;
         total += w;
     }
-    total += (REAL)g_text_spacing * (glyphs > 0 ? glyphs - 1 : 0);
+    total += (REAL)g_px_text_spacing * (glyphs > 0 ? glyphs - 1 : 0);
 
-    /* 图层矩形：在手势所在屏幕水平居中，距该屏底部 g_text_pos 像素。
+    /* 图层矩形：在手势所在屏幕水平居中，距该屏底部 g_px_text_pos 像素。
      * 余量兼顾描边、字形超出 advance 的部分与抗锯齿。 */
-    int margin = g_text_outline + g_text_size / 2 + 8;
+    int margin = g_px_text_outline + g_px_text_size / 2 + 8;
     int text_x = (g_mon.left + g_mon.right) / 2 - (int)(total / 2.0f);
-    int text_y = g_mon.bottom - g_text_pos;
+    int text_y = g_mon.bottom - g_px_text_pos;
     int lx = text_x - margin;
     int ly = text_y - margin;
     int lw = (int)total + margin * 2;
-    int lh = g_text_size + 12 + margin * 2;
+    int lh = g_px_text_size + 12 + margin * 2;
     if (!layer_ensure(&g_osd_layer, lx, ly, lw, lh)) {
         if (fmt)
             GdipDeleteStringFormat(fmt);
@@ -368,16 +375,16 @@ static void draw_osd(const wchar_t *text, bool failed)
             REAL x = (REAL)margin;              /* 局部坐标：图层原点即 (lx,ly) */
             REAL y = (REAL)margin;
             for (int i = 0; i < glyphs; i++) {
-                RectF cell = { x, y, adv[i], (REAL)(g_text_size + 12) };
+                RectF cell = { x, y, adv[i], (REAL)(g_px_text_size + 12) };
                 GdipAddPathString(path, &text[i], 1, fam, FontStyleRegular,
-                                  (REAL)g_text_size, &cell, fmt);
-                x += adv[i] + (REAL)g_text_spacing;
+                                  (REAL)g_px_text_size, &cell, fmt);
+                x += adv[i] + (REAL)g_px_text_spacing;
             }
 
             /* 先描边（主题色，可配置宽度），再把字芯填在最上层保证镂空可见。 */
-            if (g_text_outline > 0) {
+            if (g_px_text_outline > 0) {
                 GpPen *outline = NULL;
-                if (GdipCreatePen1(text_color, (REAL)g_text_outline, UnitPixel,
+                if (GdipCreatePen1(text_color, (REAL)g_px_text_outline, UnitPixel,
                                    &outline) == 0 && outline) {
                     GdipSetPenLineJoin(outline, LineJoinRound);
                     GdipDrawPath(g, outline, path);
@@ -486,13 +493,16 @@ void overlay_config(const Config *c)
     g_random      = c->random_color;
     g_trail_color = c->trail_color;
     g_fail_color  = c->fail_color;
-    g_trail_width = c->trail_width > 0 ? c->trail_width : 3;
+    /* 这几个是逻辑像素（96 DPI 基准），绘制前由 refresh_scaled_metrics 按屏换算。 */
+    g_trail_width  = c->trail_width > 0 ? c->trail_width : 3;
     g_trail_max_len = c->trail_max_length >= 0 ? c->trail_max_length : 0;
-    g_text_size   = c->text_size > 0 ? c->text_size : 26;
-    g_text_pos    = c->text_position;
-    g_text_fill   = c->text_fill_color;
+    g_text_size    = c->text_size > 0 ? c->text_size : 26;
+    g_text_pos     = c->text_position;
+    g_text_fill    = c->text_fill_color;
     g_text_outline = c->text_outline_width >= 0 ? c->text_outline_width : 3;
     g_text_spacing = c->text_letter_spacing >= 0 ? c->text_letter_spacing : 0;
+    /* 立刻按当前已知 DPI 换算一次：重载配置后到下次手势之间也要是新值。 */
+    refresh_scaled_metrics();
 }
 
 void overlay_begin(void)
@@ -512,7 +522,59 @@ void overlay_begin(void)
     }
 }
 
-/* 定位手势所在屏幕（用最新点），OSD 就画在这块屏幕上。 */
+/*
+ * 定位手势所在屏幕（用最新点），OSD 就画在这块屏幕上；同时取该屏 DPI。
+ *
+ * 配置里的 TrailWidth / TextSize / TextPosition 是逻辑像素（以 96 DPI 为基准），
+ * 必须按所在屏缩放。进程是 PerMonitorV2，整条坐标链路都是物理像素，若直接把配置
+ * 值当物理像素用，同一份配置在 200% 缩放的屏上视觉大小只有 100% 屏的一半。
+ *
+ * GetDpiForMonitor 在 shcore.dll（Win8.1+）。为不给项目增加导入依赖、也不牺牲
+ * 对更早系统的容错，这里动态解析；解析不到就退化为 96（即维持旧行为）。
+ */
+static UINT monitor_dpi(HMONITOR mon)
+{
+    typedef HRESULT(WINAPI * GetDpiForMonitorFn)(HMONITOR, int, UINT *, UINT *);
+    static GetDpiForMonitorFn fn;
+    static bool resolved;
+
+    if (!resolved) {
+        resolved = true;
+        HMODULE h = GetModuleHandleW(L"shcore.dll");
+        if (!h)
+            h = LoadLibraryW(L"shcore.dll");
+        if (h)
+            fn = (GetDpiForMonitorFn)(void *)GetProcAddress(h, "GetDpiForMonitor");
+    }
+    if (!fn)
+        return 96;
+
+    UINT dx = 96, dy = 96;
+    if (FAILED(fn(mon, 0 /*MDT_EFFECTIVE_DPI*/, &dx, &dy)) || dx == 0)
+        return 96;
+    return dx;
+}
+
+/* 逻辑像素 → 当前屏物理像素。至少返回 1，避免线宽/字号被缩成 0。 */
+static int scaled(int logical_px)
+{
+    int v = MulDiv(logical_px, (int)g_mon_dpi, 96);
+    return v > 0 ? v : (logical_px > 0 ? 1 : 0);
+}
+
+/*
+ * 每帧按当前屏 DPI 换算一次，绘制一律用这组物理像素值，而不是在十几个使用点上
+ * 分别插缩放——那样必然漏掉某处，且漏掉的地方是「算错」而非「退化」。
+ */
+static void refresh_scaled_metrics(void)
+{
+    g_px_trail_width  = scaled(g_trail_width);
+    g_px_text_size    = scaled(g_text_size);
+    g_px_text_pos     = scaled(g_text_pos);
+    g_px_text_outline = scaled(g_text_outline);
+    g_px_text_spacing = scaled(g_text_spacing);
+}
+
 static void locate_monitor(const Pt *pts, size_t n)
 {
     if (n == 0)
@@ -523,6 +585,8 @@ static void locate_monitor(const Pt *pts, size_t n)
     mi.cbSize = sizeof(mi);
     if (GetMonitorInfoW(mon, &mi))
         g_mon = mi.rcMonitor;
+    g_mon_dpi = monitor_dpi(mon);
+    refresh_scaled_metrics();
 }
 
 void overlay_update(const Pt *pts, size_t n, const char *seq, const char *action)
