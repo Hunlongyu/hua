@@ -103,12 +103,16 @@ bool action_parse_key(const char *spec, KeyCombo *out)
 
 #define KEY_MODIFIER_COUNT 4                          /* ctrl / alt / shift / win */
 #define KEY_INPUT_MAX (KEY_MODIFIER_COUNT * 2 + 2)    /* 修饰键各按下+抬起，加主键按下+抬起 */
-/* 缓冲容量是按最坏组合精确算出来的，push_key 本身不做边界检查。把这个隐式不变量
- * 固化成编译期断言：将来若加第五个修饰键，这里会立刻编译失败，而不是栈溢出。 */
-static_assert(KEY_INPUT_MAX >= 10, "INPUT 缓冲必须容纳全修饰键组合");
 
-static void push_key(INPUT *arr, int *n, WORD vk, bool up)
+/* 带容量的边界检查。不用 static_assert 是因为它在这里做不到实事：KEY_INPUT_MAX
+ * 由 KEY_MODIFIER_COUNT 推导而来，任何形如 static_assert(KEY_INPUT_MAX >= 10) 的
+ * 断言都恒真——加第五个修饰键时，改了 KEY_MODIFIER_COUNT 它照样通过，忘了改则
+ * 数组被写 12 次而它仍然通过。两个方向都拦不住，只会给人虚假的安全感。
+ * 真正的兜底是运行期检查容量，把潜在的栈溢出降级为安全丢弃。 */
+static void push_key(INPUT *arr, int *n, int cap, WORD vk, bool up)
 {
+    if (*n >= cap)
+        return;
     INPUT e;
     memset(&e, 0, sizeof(e));
     e.type = INPUT_KEYBOARD;
@@ -121,35 +125,37 @@ static bool send_key(const KeyCombo *k)
 {
     INPUT in[KEY_INPUT_MAX];
     int n = 0;
-    if (k->ctrl)  push_key(in, &n, VK_CONTROL, false);
-    if (k->alt)   push_key(in, &n, VK_MENU,    false);
-    if (k->shift) push_key(in, &n, VK_SHIFT,   false);
-    if (k->win)   push_key(in, &n, VK_LWIN,    false);
-    push_key(in, &n, k->vk, false);
-    push_key(in, &n, k->vk, true);
-    if (k->win)   push_key(in, &n, VK_LWIN,    true);
-    if (k->shift) push_key(in, &n, VK_SHIFT,   true);
-    if (k->alt)   push_key(in, &n, VK_MENU,    true);
-    if (k->ctrl)  push_key(in, &n, VK_CONTROL, true);
+    if (k->ctrl)  push_key(in, &n, KEY_INPUT_MAX, VK_CONTROL, false);
+    if (k->alt)   push_key(in, &n, KEY_INPUT_MAX, VK_MENU,    false);
+    if (k->shift) push_key(in, &n, KEY_INPUT_MAX, VK_SHIFT,   false);
+    if (k->win)   push_key(in, &n, KEY_INPUT_MAX, VK_LWIN,    false);
+    push_key(in, &n, KEY_INPUT_MAX, k->vk, false);
+    push_key(in, &n, KEY_INPUT_MAX, k->vk, true);
+    if (k->win)   push_key(in, &n, KEY_INPUT_MAX, VK_LWIN,    true);
+    if (k->shift) push_key(in, &n, KEY_INPUT_MAX, VK_SHIFT,   true);
+    if (k->alt)   push_key(in, &n, KEY_INPUT_MAX, VK_MENU,    true);
+    if (k->ctrl)  push_key(in, &n, KEY_INPUT_MAX, VK_CONTROL, true);
 
     UINT sent = SendInput((UINT)n, in, sizeof(INPUT));
     if (sent == (UINT)n)
         return true;
 
     /*
-     * 部分注入：序列是「修饰键↓ … 修饰键↑」，若在修饰键按下之后中断，该修饰键会
-     * 全系统卡在按下状态——此后用户的每次点击都变成 Ctrl+Click，且必须手动敲一下
-     * 该键才能解除。故补发一次修饰键释放；对未按下的键补 KEYUP 是无害的。
+     * 部分注入：序列是「修饰键↓ 主键↓ 主键↑ 修饰键↑」，任何一处中断都会把已按下的
+     * 键留在按下状态——修饰键卡住会让此后每次点击都变成 Ctrl+Click，主键卡住则会
+     * 触发自动重复、向目标狂灌字符，两者都必须用户手动敲一下才能解除。
+     * 主键也要补：中断点若落在「主键↓ 之后、主键↑ 之前」，只放修饰键是不够的。
+     * 对本就没按下的键补 KEYUP 是无害的。
      */
-    INPUT rel[KEY_MODIFIER_COUNT];
+    INPUT rel[KEY_MODIFIER_COUNT + 1];
     int m = 0;
-    if (k->ctrl)  push_key(rel, &m, VK_CONTROL, true);
-    if (k->alt)   push_key(rel, &m, VK_MENU,    true);
-    if (k->shift) push_key(rel, &m, VK_SHIFT,   true);
-    if (k->win)   push_key(rel, &m, VK_LWIN,    true);
-    if (m > 0)
-        SendInput((UINT)m, rel, sizeof(INPUT));
-    HUA_LOG_W("SendInput 仅注入 %u/%d 个事件，已补发修饰键释放", sent, n);
+    push_key(rel, &m, KEY_MODIFIER_COUNT + 1, k->vk, true);
+    if (k->ctrl)  push_key(rel, &m, KEY_MODIFIER_COUNT + 1, VK_CONTROL, true);
+    if (k->alt)   push_key(rel, &m, KEY_MODIFIER_COUNT + 1, VK_MENU,    true);
+    if (k->shift) push_key(rel, &m, KEY_MODIFIER_COUNT + 1, VK_SHIFT,   true);
+    if (k->win)   push_key(rel, &m, KEY_MODIFIER_COUNT + 1, VK_LWIN,    true);
+    SendInput((UINT)m, rel, sizeof(INPUT));   /* m 恒 >= 1 */
+    HUA_LOG_W("SendInput 仅注入 %u/%d 个事件，已补发按键释放", sent, n);
     return false;
 }
 

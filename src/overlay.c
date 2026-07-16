@@ -501,10 +501,15 @@ void overlay_begin(void)
     static const unsigned palette[] = {
         0x00A0FF, 0xFF5252, 0x4CAF50, 0xFFC107, 0xE040FB, 0x00BCD4,
     };
-    if (g_random)
-        g_cur_color = palette[g_color_idx++ % (int)(sizeof(palette) / sizeof(palette[0]))];
-    else
+    if (g_random) {
+        /* 先取模再自增：无界自增到 INT_MAX 是有符号溢出（UB），回绕成负数后
+         * palette[负数] 就是越界读。虽然要约 2^31 次手势才可达，但零成本可避。 */
+        int n = (int)(sizeof(palette) / sizeof(palette[0]));
+        g_cur_color = palette[g_color_idx];
+        g_color_idx = (g_color_idx + 1) % n;
+    } else {
         g_cur_color = g_trail_color;
+    }
 }
 
 /* 定位手势所在屏幕（用最新点），OSD 就画在这块屏幕上。 */
