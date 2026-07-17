@@ -59,6 +59,7 @@ target_compile_definitions(hua_inih PUBLIC INI_ALLOW_MULTILINE=0)
 add_library(hua_core STATIC
   src/recognizer.c
   src/config.c
+  src/watchdog.c
 )
 target_include_directories(hua_core PUBLIC src)
 target_link_libraries(hua_core PRIVATE hua_inih hua_warnings)
@@ -104,6 +105,12 @@ add_executable(test_action tests/test_action.c src/action.c src/platform.c)
 target_include_directories(test_action PRIVATE src third_party)
 target_link_libraries(test_action PRIVATE user32 shell32 hua_warnings)
 add_test(NAME action COMMAND test_action)
+
+# 钩子探活判定测试（watchdog.c 在 hua_core 内，纯逻辑无 Win32 依赖）。
+add_executable(test_watchdog tests/test_watchdog.c)
+target_link_libraries(test_watchdog PRIVATE hua_core hua_warnings)
+target_include_directories(test_watchdog PRIVATE third_party)
+add_test(NAME watchdog COMMAND test_watchdog)
 
 # config 解析测试（config.c 在 hua_core 内）。
 add_executable(test_config tests/test_config.c)

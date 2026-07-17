@@ -5,6 +5,7 @@
 #include "hua.h"
 #include "platform.h"
 #include "recognizer.h"
+#include "watchdog.h"
 
 #include <string.h>
 
@@ -26,7 +27,7 @@ static ULONGLONG  g_last_input_tick;
 static ULONGLONG  g_last_cb_tick;
 static Pt         g_wd_pos;
 static ULONGLONG  g_wd_tick;
-static int        g_suspect;   /* 连续可疑周期数，达 2 才判定失效（滤误判） */
+static WatchdogState g_wd_state;   /* 判定状态，逻辑在 watchdog.c（有单测） */
 static bool       g_suppress_trigger_up;
 static Pt         g_pts[HOOK_MAX_PTS];
 static size_t     g_npts;
@@ -268,51 +269,26 @@ bool hook_is_idle(void) { return g_state == ST_IDLE; }
  */
 bool hook_looks_dead(void)
 {
-    /* 没装上也要报告为「需要装」：hook_install 失败会让 g_hook 停在 NULL，
-     * 若此处返回 false，watchdog 就在最需要它的场景（安装失败）里永久失能。 */
-    if (!g_hook)
-        return true;
-
+    /* 本函数只负责采样，判定交给 watchdog_should_reinstall（纯逻辑、有单测）。
+     * 这个判定曾两次写错且都逃过肉眼 review，故把它挪出 Win32 代码。 */
     POINT p;
     ULONGLONG now = GetTickCount64();
-    if (!GetCursorPos(&p)) {
-        /* 取不到光标（切到非输入桌面时会失败）：零信息。推进基线时刻避免下周期
-         * 拿过期值比较，但**不能**清 g_suspect —— 那等于把已积累的证据丢掉。 */
-        g_wd_tick = now;
-        return false;
+
+    WatchdogSample s;
+    s.installed    = (g_hook != NULL);
+    s.cursor_ok    = GetCursorPos(&p) ? true : false;
+    s.moved        = false;
+    s.last_cb_tick = g_last_cb_tick;
+    s.prev_tick    = g_wd_tick;
+
+    if (s.cursor_ok) {
+        s.moved = (p.x != g_wd_pos.x || p.y != g_wd_pos.y);
+        g_wd_pos.x = (int)p.x;
+        g_wd_pos.y = (int)p.y;
     }
+    g_wd_tick = now;   /* 无论成败都推进基线，避免下周期拿过期值比较 */
 
-    bool moved = (p.x != g_wd_pos.x || p.y != g_wd_pos.y);
-    /* 本周期内确实收到过回调 —— 这是唯一能证明钩子存活的证据。 */
-    bool alive   = (g_wd_tick != 0 && g_last_cb_tick >= g_wd_tick);
-    /* 动过却零事件 → 可疑。 */
-    bool suspect = (g_wd_tick != 0 && moved && g_last_cb_tick < g_wd_tick);
-
-    g_wd_pos.x = (int)p.x;
-    g_wd_pos.y = (int)p.y;
-    g_wd_tick  = now;
-
-    /*
-     * 三态而非两态，这是关键：「光标没动」既不能证明钩子活着、也不能证明它死了，
-     * 是**零信息**，必须保留已积累的证据。若把它当作健康证据去清零计数器，那么
-     * 钩子死后用户以最常见的间歇方式用鼠标（动→停→动→停），计数器永远到不了 2，
-     * watchdog 将无限期不触发 —— 恰恰在它唯一存在的理由上失效。
-     *
-     * 要求连续两周期可疑才判定，是为了滤掉误判：安全桌面（UAC 同意框、锁屏、
-     * Ctrl+Alt+Del）期间鼠标事件不派发到我们的钩子，但 GetCursorPos 读的是全局
-     * 光标位置、照样在变；SetCursorPos 类工具（mouse jiggler 等）同理。
-     */
-    if (alive) {
-        g_suspect = 0;
-        return false;
-    }
-    if (!suspect)
-        return false;   /* 零信息：保留计数，绝不清零 */
-    g_suspect++;
-    if (g_suspect < 2)
-        return false;
-    g_suspect = 0;
-    return true;
+    return watchdog_should_reinstall(&g_wd_state, &s);
 }
 
 const char *hook_last_seq(void)   { return g_seq; }
