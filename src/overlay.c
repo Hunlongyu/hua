@@ -11,6 +11,7 @@
 #include "overlay.h"
 #include "gdiplus_flat.h"
 #include "hua.h"
+#include "hook.h"   /* HOOK_MAX_PTS —— 仅用于下面的编译期断言（overlay 在 hook 之上，依赖方向合法） */
 
 #include <math.h>
 #include <stdio.h>
@@ -19,6 +20,18 @@
 #define OVERLAY_CLASS L"HuaOverlay"
 #define FADE_TIMER_ID 1
 #define MAX_DRAW_PTS  4096
+
+/*
+ * draw_trail 必须画得下 hook 可能交出的全部采样点。
+ *
+ * 两个常量此前恰好都是 4096，故 draw_trail 的截断分支永不触发——但两者之间没有
+ * 任何关联，一旦哪天把 HOOK_MAX_PTS 调大，截断就会生效，且方向是反的：它取的是
+ * **最旧**的 MAX_DRAW_PTS 个点、丢掉末端，于是轨迹定格在第 4096 个点、箭头不再
+ * 跟手，而 locate_monitor 仍用真末点 → OSD 与轨迹分处两屏。没有任何报错。
+ */
+_Static_assert(MAX_DRAW_PTS >= HOOK_MAX_PTS,
+               "MAX_DRAW_PTS 必须 >= HOOK_MAX_PTS：否则 draw_trail 会丢掉轨迹末端，"
+               "表现为手势画一半就卡住且无任何报错");
 #define OSD_MAX_GLYPHS 64   /* 动作名/提示文字最多字形数（逐字排版缓冲） */
 #define SURF_GRAN     128   /* DIB 尺寸上取整粒度，减少重建次数 */
 
@@ -421,8 +434,14 @@ static LRESULT CALLBACK overlay_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             layer_free_surface(&g_trail_layer);
             layer_free_surface(&g_osd_layer);
         } else {
-            layer_present(&g_trail_layer, (BYTE)g_fade);
-            layer_present(&g_osd_layer, (BYTE)g_fade);
+            /* 只淡出本轮真正显示着的层。不能无条件 present：layer_present 会把
+             * 隐藏的层重新 ShowWindow 出来——若上一手势的 OSD 尚在淡出途中被新一次
+             * 点击打断（KillTimer 后 shown 仍为真、旧文字仍留在表面里），而这次点击
+             * 是空串走了 layer_hide(OSD)，则这里会把上一条动作名的残影闪回屏幕。 */
+            if (g_trail_layer.shown)
+                layer_present(&g_trail_layer, (BYTE)g_fade);
+            if (g_osd_layer.shown)
+                layer_present(&g_osd_layer, (BYTE)g_fade);
         }
         return 0;
     }
@@ -555,11 +574,22 @@ static UINT monitor_dpi(HMONITOR mon)
     return dx;
 }
 
-/* 逻辑像素 → 当前屏物理像素。至少返回 1，避免线宽/字号被缩成 0。 */
+/*
+ * 逻辑像素 → 当前屏物理像素。非零输入至少返回 ±1，避免线宽/字号被缩成 0。
+ *
+ * 必须保号：只有 TextPosition 可以是负数（config.c 专门放行 -10000..10000，语义是
+ * 把 OSD 放到该屏底边**以下**，用于上下堆叠的多屏布局）。此前的写法
+ * `return v > 0 ? v : (logical_px > 0 ? 1 : 0);` 把一切负值塌成 0 —— 与 DPI 无关，
+ * 96 DPI 下同样塌 —— 该特性 100% 失效，且 -1 与 -9999 无法区分。
+ */
 static int scaled(int logical_px)
 {
+    if (logical_px == 0)
+        return 0;
     int v = MulDiv(logical_px, (int)g_mon_dpi, 96);
-    return v > 0 ? v : (logical_px > 0 ? 1 : 0);
+    if (v == 0)                       /* 缩到 0：保底 ±1，别让非零配置退化成「无」 */
+        return logical_px > 0 ? 1 : -1;
+    return v;
 }
 
 /*

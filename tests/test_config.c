@@ -4,6 +4,8 @@
 #include "config.h"
 #include "utest.h"
 
+#include <stdio.h>
+
 UTEST(config, defaults)
 {
     Config c;
@@ -26,6 +28,10 @@ UTEST(config, defaults)
     ASSERT_EQ(c.text_position, 150);
     ASSERT_EQ(c.pause_timeout, 1000);
     ASSERT_TRUE(c.restore_event);
+    ASSERT_TRUE(c.log_enabled);
+    ASSERT_EQ(c.log_level, CFG_LOG_WARN);
+    ASSERT_EQ(c.log_max_size_mb, 10);
+    ASSERT_EQ(c.log_retention_days, 2);
 }
 
 UTEST(config, parse_mouseinc_items)
@@ -66,7 +72,9 @@ UTEST(config, clamps_out_of_range_values)
         "TrailWidth=2000000000\n"
         "TextSize=2000000000\n"
         "TextOutlineWidth=999999\n"
-        "TextLetterSpacing=999999\n");
+        "TextLetterSpacing=999999\n"
+        "LogMaxSizeMB=999999\n"
+        "LogRetentionDays=999999\n");
     ASSERT_EQ(c.tolerance, CFG_MAX_TOLERANCE);
     ASSERT_EQ(c.min_distance, 10000);
     ASSERT_EQ(c.step_distance, 10000);
@@ -75,6 +83,8 @@ UTEST(config, clamps_out_of_range_values)
     ASSERT_EQ(c.text_size, 500);
     ASSERT_EQ(c.text_outline_width, 100);
     ASSERT_EQ(c.text_letter_spacing, 500);
+    ASSERT_EQ(c.log_max_size_mb, 1024);
+    ASSERT_EQ(c.log_retention_days, 3650);
 }
 
 UTEST(config, invalid_positive_fields_fall_back_to_defaults)
@@ -88,12 +98,16 @@ UTEST(config, invalid_positive_fields_fall_back_to_defaults)
         "StepDistance=-5\n"
         "TriggerDistance=-1\n"
         "TrailWidth=0\n"
-        "TextSize=-100\n");
+        "TextSize=-100\n"
+        "LogMaxSizeMB=0\n"
+        "LogRetentionDays=-1\n");
     ASSERT_EQ(c.min_distance, 20);
     ASSERT_EQ(c.step_distance, 12);
     ASSERT_EQ(c.trigger_distance, 5);
     ASSERT_EQ(c.trail_width, 3);
     ASSERT_EQ(c.text_size, 26);
+    ASSERT_EQ(c.log_max_size_mb, 10);
+    ASSERT_EQ(c.log_retention_days, 2);
 }
 
 UTEST(config, garbage_text_falls_back_to_defaults)
@@ -105,11 +119,15 @@ UTEST(config, garbage_text_falls_back_to_defaults)
         "MinDistance=二十\n"
         "StepDistance=auto\n"
         "TextSize=O\n"
-        "TrailWidth=\n");
+        "TrailWidth=\n"
+        "LogMaxSizeMB=ten\n"
+        "LogRetentionDays=seven\n");
     ASSERT_EQ(c.min_distance, 20);
     ASSERT_EQ(c.step_distance, 12);
     ASSERT_EQ(c.text_size, 26);
     ASSERT_EQ(c.trail_width, 3);
+    ASSERT_EQ(c.log_max_size_mb, 10);
+    ASSERT_EQ(c.log_retention_days, 2);
 }
 
 UTEST(config, zero_is_meaningful_for_some_fields)
@@ -139,6 +157,10 @@ UTEST(config, parse_general_fields)
         "Tolerance = 1\n"
         "FilterMode = whitelist\n"
         "DisableOnFullscreen = false\n"
+        "LogEnabled = false\n"
+        "LogLevel = error\n"
+        "LogMaxSizeMB = 25\n"
+        "LogRetentionDays = 30\n"
         "TrailWidth = 5\n"
         "TrailColor = FF8800\n";
     ASSERT_TRUE(config_parse_string(&c, ini));
@@ -148,8 +170,25 @@ UTEST(config, parse_general_fields)
     ASSERT_EQ(c.tolerance, 1);
     ASSERT_EQ(c.filter_mode, CFG_FILTER_WHITELIST);
     ASSERT_FALSE(c.disable_on_fullscreen);
+    ASSERT_FALSE(c.log_enabled);
+    ASSERT_EQ(c.log_level, CFG_LOG_ERROR);
+    ASSERT_EQ(c.log_max_size_mb, 25);
+    ASSERT_EQ(c.log_retention_days, 30);
     ASSERT_EQ(c.trail_width, 5);
     ASSERT_EQ((int)c.trail_color, 0xFF8800);
+}
+
+UTEST(config, log_levels_and_invalid_fallback)
+{
+    Config c;
+    config_parse_string(&c, "[General]\nLogLevel=warning\n");
+    ASSERT_EQ(c.log_level, CFG_LOG_WARN);
+    ASSERT_EQ(c.diag.bad_values, 0);
+
+    config_parse_string(&c, "[General]\nLogLevel=verbose\n");
+    ASSERT_EQ(c.log_level, CFG_LOG_WARN);
+    ASSERT_EQ(c.diag.bad_values, 1);
+    ASSERT_STREQ(c.diag.first_issue, "LogLevel");
 }
 
 UTEST(config, parse_global_gestures)
@@ -336,9 +375,18 @@ UTEST(resolve, app_none_suppresses_global)
     config_parse_string(&c,
         "[Gestures]\n39=key:f5\n"
         "[App:powerpnt.exe]\n39=cmd:none\n");
-    /* PPT 里 39 被显式屏蔽：必须返回 NULL，绝不能回落到全局的 key:f5 */
+    /* 识别器已把视觉 V 归一为 39，PPT 只需显式屏蔽这一条。 */
     ASSERT_TRUE(config_resolve(&c, "powerpnt.exe", "39") == NULL);
     /* 其他程序不受影响 */
+    ASSERT_STREQ(config_resolve(&c, "notepad.exe", "39"), "key:f5");
+}
+
+UTEST(resolve, down_up_and_v_are_independent)
+{
+    Config c;
+    config_parse_string(&c,
+        "[Gestures]\n28=cmd:scroll_bottom\n39=key:f5\n");
+    ASSERT_STREQ(config_resolve(&c, "notepad.exe", "28"), "cmd:scroll_bottom");
     ASSERT_STREQ(config_resolve(&c, "notepad.exe", "39"), "key:f5");
 }
 
@@ -373,6 +421,134 @@ UTEST(resolve, tolerance_is_clamped_to_sane_upper_bound)
      * 荒谬的值被夹到有意义的上界，不改变容错本身的语义。 */
     config_parse_string(&c, "[General]\nTolerance=99\n[Gestures]\n26=cmd:close_window\n");
     ASSERT_EQ(c.tolerance, CFG_MAX_TOLERANCE);
+}
+
+/* ---------------- 布尔值回落（与数值的 fallback_clamp 同一哲学） ---------------- */
+
+/*
+ * 无法解析的布尔值必须回落到该字段的文档默认值，而不是一律 false。
+ * 数值字段早就这么做了（`MinDistance = 二十` → 回落 20，见
+ * garbage_text_falls_back_to_defaults），布尔字段此前却把一切无法识别的输入
+ * 翻成 false —— 而受害的五个字段默认全是 true。后果最重的是
+ * `DisableOnFullscreen = ture`（手误）：全屏门控被静默关掉，手势会在全屏游戏里误触发。
+ */
+UTEST(config, garbage_bool_falls_back_to_default)
+{
+    Config c;
+    const char *ini =
+        "[General]\n"
+        "ShowTrail = \xE7\x9C\x9F\n"            /* 真 */
+        "DisableOnFullscreen = ture\n"          /* true 的手误 */
+        "RestoreEvent = enable\n"
+        "TrailArrow = \xE6\x98\xAF\n"           /* 是 */
+        "[App:game.exe]\n"
+        "Enabled = enabled\n";
+    ASSERT_TRUE(config_parse_string(&c, ini));
+    ASSERT_TRUE(c.show_trail);
+    ASSERT_TRUE(c.disable_on_fullscreen);
+    ASSERT_TRUE(c.restore_event);
+    ASSERT_TRUE(c.trail_arrow);
+    const AppConfig *game = config_find_app(&c, "game.exe");
+    ASSERT_TRUE(game != NULL);
+    ASSERT_TRUE(game->enabled);      /* 默认启用；只有明确的 false 才禁用 */
+    ASSERT_EQ(c.diag.bad_values, 5);
+}
+
+/* 默认为 false 的字段同样回落到 false（防止「回落」被误实现成一律 true）。 */
+UTEST(config, garbage_bool_falls_back_to_false_when_default_is_false)
+{
+    Config c;
+    ASSERT_TRUE(config_parse_string(&c, "[General]\nAutoStart=ture\nRandomColor=\xE7\x9C\x9F\n"));
+    ASSERT_FALSE(c.auto_start);
+    ASSERT_FALSE(c.random_color);
+}
+
+/* 防回归：合法写法必须原样生效，不能被回落逻辑吃掉。 */
+UTEST(config, well_formed_bools_are_unaffected)
+{
+    Config c;
+    const char *ini =
+        "[General]\n"
+        "ShowTrail = false\n"
+        "DisableOnFullscreen = off\n"
+        "RestoreEvent = 0\n"
+        "TrailArrow = no\n"
+        "RandomColor = TRUE\n"
+        "AutoStart = Yes\n"
+        "[App:game.exe]\n"
+        "Enabled = false\n";
+    ASSERT_TRUE(config_parse_string(&c, ini));
+    ASSERT_FALSE(c.show_trail);
+    ASSERT_FALSE(c.disable_on_fullscreen);
+    ASSERT_FALSE(c.restore_event);
+    ASSERT_FALSE(c.trail_arrow);
+    ASSERT_TRUE(c.random_color);
+    ASSERT_TRUE(c.auto_start);
+    ASSERT_FALSE(config_find_app(&c, "game.exe")->enabled);
+    ASSERT_EQ(c.diag.bad_values, 0);
+}
+
+/* ---------------- 解析诊断 ---------------- */
+
+/* [General] 里拼错的键此前被静默忽略：设置永远不生效，日志一片祥和。 */
+UTEST(config, unknown_key_is_reported)
+{
+    Config c;
+    ASSERT_TRUE(config_parse_string(&c, "[General]\nTrailWith = 5\nTorlerance = 1\n"));
+    ASSERT_EQ(c.diag.unknown_keys, 2);
+    ASSERT_STREQ(c.diag.first_issue, "TrailWith");
+    ASSERT_EQ(c.trail_width, 3);        /* 未被误写 */
+}
+
+UTEST(config, known_keys_are_not_reported_as_unknown)
+{
+    Config c;
+    ASSERT_TRUE(config_parse_string(&c, "[General]\nTrailWidth = 5\n"));
+    ASSERT_EQ(c.diag.unknown_keys, 0);
+    ASSERT_EQ(c.trail_width, 5);
+}
+
+/* 容量上限撞满后此前静默丢弃：第 129 条起的手势永不生效且无从排查。 */
+UTEST(config, gesture_overflow_is_reported)
+{
+    static char ini[CFG_MAX_GESTURES * 32 + 256];
+    int off = snprintf(ini, sizeof(ini), "[Gestures]\n");
+    for (int i = 0; i < CFG_MAX_GESTURES + 5; i++)
+        off += snprintf(ini + off, sizeof(ini) - (size_t)off,
+                        "%d = cmd:minimize\n", 1000 + i);
+    static Config c;
+    ASSERT_TRUE(config_parse_string(&c, ini));
+    ASSERT_EQ((int)c.gesture_count, CFG_MAX_GESTURES);
+    ASSERT_EQ(c.diag.dropped, 5);
+}
+
+UTEST(config, app_overflow_is_reported)
+{
+    static char ini[CFG_MAX_APPS * 48 + 256];
+    int off = 0;
+    ini[0] = '\0';
+    for (int i = 0; i < CFG_MAX_APPS + 3; i++)
+        off += snprintf(ini + off, sizeof(ini) - (size_t)off,
+                        "[App:a%03d.exe]\n26 = cmd:minimize\n", i);
+    static Config c;
+    ASSERT_TRUE(config_parse_string(&c, ini));
+    ASSERT_EQ((int)c.app_count, CFG_MAX_APPS);
+    ASSERT_TRUE(c.diag.dropped >= 3);
+}
+
+/* 干净配置不得报出任何诊断（否则日志会天天喊狼来了）。 */
+UTEST(config, clean_config_reports_nothing)
+{
+    Config c;
+    const char *ini =
+        "[General]\nTrigger = right\nMinDistance = 20\nShowTrail = true\n"
+        "[Gestures]\n26 = cmd:close_window\n"
+        "[App:chrome.exe]\n26 = key:ctrl+w\n";
+    ASSERT_TRUE(config_parse_string(&c, ini));
+    ASSERT_EQ(c.diag.dropped, 0);
+    ASSERT_EQ(c.diag.unknown_keys, 0);
+    ASSERT_EQ(c.diag.bad_values, 0);
+    ASSERT_STREQ(c.diag.first_issue, "");
 }
 
 UTEST_MAIN();

@@ -10,10 +10,17 @@
 #include <stddef.h>
 
 typedef enum {
-    HUA_LOG_INFO,
+    HUA_LOG_INFO = 0,
     HUA_LOG_WARN,
     HUA_LOG_ERROR,
+    HUA_LOG_OFF,
 } HuaLogLevel;
+
+/*
+ * 设置日志策略。可在 hua_log_init 前调用（决定是否创建日志），也可在热加载配置时
+ * 调用。max_size_mb / retention_days 会在配置层夹到正数范围。
+ */
+void hua_log_configure(HuaLogLevel min_level, int max_size_mb, int retention_days);
 
 /* 打开/关闭日志文件（exe 同目录下 hua.log，UTF-8 追加写）。 */
 void hua_log_init(void);

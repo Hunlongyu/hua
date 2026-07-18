@@ -9,7 +9,7 @@
 
 #include <string.h>
 
-#define HOOK_MAX_PTS 4096
+/* HOOK_MAX_PTS 现由 hook.h 导出（overlay 需要它做编译期断言）。 */
 
 typedef enum { ST_IDLE = 0, ST_TENTATIVE, ST_ACTIVE } HookState;
 
@@ -29,6 +29,9 @@ static Pt         g_wd_pos;
 static ULONGLONG  g_wd_tick;
 static WatchdogState g_wd_state;   /* 判定状态，逻辑在 watchdog.c（有单测） */
 static bool       g_suppress_trigger_up;
+/* 抑制那个 Up 的同时，还要在它到来时补发一次原生点击（见 hook_arm_replay_on_up）。
+ * 只有 g_suppress_trigger_up 为真时才有意义。 */
+static bool       g_replay_on_up;
 static Pt         g_pts[HOOK_MAX_PTS];
 static size_t     g_npts;
 static Pt         g_start;
@@ -161,6 +164,7 @@ static LRESULT handle_event(WPARAM msg, const MSLLHOOKSTRUCT *ms)
     if (is_trigger_down(msg, ms)) {
         /* 新一轮输入开始；清除上一轮因外部工具吞 Up 留下的抑制标记。 */
         g_suppress_trigger_up = false;
+        g_replay_on_up = false;
         HWND target = target_from_point(ms->pt);
         /* 门控和后续动作始终使用起点下方的同一个目标窗口。 */
         if (g_gate && !g_gate(target))
@@ -184,9 +188,17 @@ static LRESULT handle_event(WPARAM msg, const MSLLHOOKSTRUCT *ms)
     }
 
     if (is_trigger_up(msg, ms)) {
-        /* 轨迹超时后仍要吞掉迟到的物理 Up，绝不把它泄漏给目标程序。 */
+        /* 轨迹超时后仍要吞掉迟到的物理 Up，绝不把它泄漏给目标程序：Down 早已被吞，
+         * 放行一个孤儿 Up 只会让目标程序收到没有配对 Down 的事件。 */
         if (g_suppress_trigger_up) {
+            bool replay = g_replay_on_up;
             g_suppress_trigger_up = false;
+            g_replay_on_up = false;
+            /* 超时时判定「根本没划出手势」→ 这次就是一次普通点击，此刻（用户真正
+             * 松手的时刻）补发原生点击，菜单便和平时一样在松手时弹出。补发本身走
+             * 主线程，绝不在 LL 回调里调 SendInput。 */
+            if (replay)
+                PostMessage(g_notify, WM_HUA_HOOK, HUA_EV_GESTURE_CANCEL, 0);
             return 1;
         }
 
@@ -240,6 +252,7 @@ bool hook_install(HWND notify_hwnd, HuaTrigger trigger,
     g_step_dist   = step_dist > 0 ? step_dist : 12;
     g_state       = ST_IDLE;
     g_suppress_trigger_up = false;
+    g_replay_on_up = false;
     g_hook = SetWindowsHookExW(WH_MOUSE_LL, low_level_mouse_proc,
                                GetModuleHandleW(NULL), 0);
     return g_hook != NULL;
@@ -254,6 +267,7 @@ void hook_uninstall(void)
     g_notify = NULL;
     g_state  = ST_IDLE;
     g_suppress_trigger_up = false;
+    g_replay_on_up = false;
     /* 必须一并清空采样点：否则重装后主线程若仍在跑 TIMER_FRAME，
      * hook_snapshot() 会返回上一轮的陈旧轨迹，浮层会把它永久画在屏幕上。 */
     g_npts   = 0;
@@ -360,5 +374,26 @@ bool hook_cancel_if_timed_out(DWORD timeout_ms, HookTimeoutInfo *info)
 }
 
 void hook_replay_trigger_click(void) { synth_click(g_trigger); }
+
+/*
+ * 安排「这次的物理 Up 到来时补发一次原生点击」。
+ *
+ * 只在 hook_cancel_if_timed_out 返回 true 之后由主线程调用，且仅当那次超时**没有
+ * 划出任何方向段**时——那种情况下用户其实只是按住触发键不动想了一下，手抖
+ * TriggerDistance(默认 5px) 就足以把状态推进 ST_ACTIVE，于是 Down 被吞、Up 也被
+ * g_suppress_trigger_up 吞掉，这次右键凭空消失、菜单永远不弹。
+ * （hook_cancel_if_timed_out 上方的注释刻意不把 ST_TENTATIVE 纳入超时正是为了保护
+ * 这个操作，但那层保护挡不住 5px 手抖推进来的 ST_ACTIVE。）
+ *
+ * 为什么不在超时的当下直接补发：此刻按键还**物理按着**，那样菜单会在按下满 1 秒时
+ * 突然弹出，而不是在用户松手时。推迟到 Up 才补发，观感与原生右键完全一致。
+ *
+ * 「要不要补发」是配置决策（RestoreEvent），故留在 main.c 判；hook 只提供机制。
+ */
+void hook_arm_replay_on_up(void)
+{
+    if (g_suppress_trigger_up)
+        g_replay_on_up = true;
+}
 
 void hook_set_gate(HookGateFn fn) { g_gate = fn; }

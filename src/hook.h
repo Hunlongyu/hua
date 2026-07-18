@@ -19,6 +19,10 @@
 #include <stddef.h>
 #include "recognizer.h"   /* Pt */
 
+/* 采样点环形缓冲容量。导出是为了让 overlay 能在编译期断言自己画得下全部点
+ * （见 overlay.c 的 _Static_assert）。 */
+#define HOOK_MAX_PTS 4096
+
 typedef enum {
     HUA_TRIGGER_RIGHT = 0,
     HUA_TRIGGER_MIDDLE,
@@ -76,6 +80,16 @@ bool hook_cancel_if_timed_out(DWORD timeout_ms, HookTimeoutInfo *info);
 
 /* 补发一次原生触发键点击（下+上）。仅用于未形成轨迹时还原原生行为。 */
 void hook_replay_trigger_click(void);
+
+/*
+ * 安排「本次的物理 Up 到来时补发一次原生点击」，届时经 HUA_EV_GESTURE_CANCEL 通知。
+ *
+ * 仅在 hook_cancel_if_timed_out 返回 true 之后、且那次超时未形成任何方向段时调用：
+ * 那说明用户只是按住触发键不动想了一下（手抖 TriggerDistance 就够进 ST_ACTIVE），
+ * 不补发的话 Down 与 Up 双双被吞，这次点击凭空消失。
+ * 不在超时当下补发，是因为按键此刻还物理按着——推迟到 Up 才补，观感才与原生一致。
+ */
+void hook_arm_replay_on_up(void);
 
 /*
  * 门控回调：在触发键按下时调用，target 是按下点下方锁定的顶层窗口；

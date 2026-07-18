@@ -15,10 +15,13 @@
 #include "overlay.h"
 #include "autostart.h"
 #include "default_ini.h"
+#include "ini_edit.h"
 #include "resource.h"
+#include "update.h"
 
 #include <shellapi.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <wchar.h>
 #include <string.h>
 
@@ -40,6 +43,7 @@ static ULONGLONG g_last_revive_log;   /* 上次打印钩子重装日志的时刻
 #define IDM_AUTOSTART 1003
 #define IDM_PROJECT   1004
 #define IDM_EXIT      1005
+#define IDM_UPDATE    1006
 
 static HINSTANCE g_hinst;
 static HWND      g_hwnd;
@@ -51,7 +55,10 @@ static UINT      g_wm_taskbar_created;
 
 /* ini 文件监听（热加载） */
 static HANDLE        g_watch_thread;
-static volatile LONG g_watch_stop;
+/* 停止信号。有了它，监听线程就能在「目录有变化」与「该退了」之间无超时地等待——
+ * 既不必每 300ms 醒来查一眼是否该停（这个进程绝大多数时间是完全空闲的），
+ * 退出也从「最长等一整轮」变成即时。手动重置：一次 Set 要能叫醒并停住线程。 */
+static HANDLE        g_watch_stop_evt;
 static wchar_t       g_watch_dir[MAX_PATH];
 static wchar_t       g_watch_path[MAX_PATH];
 
@@ -193,6 +200,55 @@ static void resolve_ini_path(void)
     }
 }
 
+static void apply_log_config(const Config *c)
+{
+    HuaLogLevel level = c->log_enabled ? (HuaLogLevel)c->log_level : HUA_LOG_OFF;
+    hua_log_configure(level, c->log_max_size_mb, c->log_retention_days);
+}
+
+/*
+ * 日志必须在正式初始化前先读到策略：否则 LogEnabled=false 的每次启动仍会先创建
+ * 文件并写一行启动日志，语义上并没有真正关闭。这里只做一次无副作用的预解析；
+ * load_config 稍后仍负责完整诊断、外观应用与热加载。
+ */
+static void configure_log_before_init(void)
+{
+    resolve_ini_path();
+    /* Config 内含完整 per-app 手势表，超过默认 1 MB 主线程栈，必须放静态存储。 */
+    static Config bootstrap;
+    char *text = g_ini_path[0] ? hua_read_file(g_ini_path, NULL) : NULL;
+    if (text) {
+        config_parse_string(&bootstrap, text);
+        hua_free(text);
+    } else {
+        config_set_defaults(&bootstrap);
+    }
+    apply_log_config(&bootstrap);
+}
+
+/*
+ * 把 config 攒下的解析诊断打出来。config 模块零 Win32 依赖、不能自己打日志，
+ * 故它只计数，由这里翻译成人话。三类问题此前都是彻底静默的：用户拼错一个键、
+ * 写了个 `ShowTrail = 真`、或手势超过 128 条，都只会表现为「这项设置莫名不生效」。
+ */
+static void log_config_diag(const Config *c)
+{
+    const char *first = c->diag.first_issue[0] ? c->diag.first_issue : "?";
+    if (c->diag.unknown_keys > 0)
+        HUA_LOG_W("配置中有 %d 个无法识别的键（首个：%s），已忽略——请检查拼写",
+                  c->diag.unknown_keys, first);
+    if (c->diag.bad_values > 0)
+        HUA_LOG_W("配置中有 %d 个值无法识别（首个：%s），已按默认值处理；"
+                  "布尔开关接受 true/false（也认 1/0、yes/no、on/off），"
+                  "日志等级接受 off/error/warn/info",
+                  c->diag.bad_values, first);
+    if (c->diag.dropped > 0)
+        HUA_LOG_W("配置超出容量上限，已丢弃 %d 项（首个：%s）；上限：全局手势 %d 条、"
+                  "程序节 %d 个、每程序手势 %d 条",
+                  c->diag.dropped, first,
+                  CFG_MAX_GESTURES, CFG_MAX_APPS, CFG_MAX_APP_GESTURES);
+}
+
 static void load_config(void)
 {
     resolve_ini_path();
@@ -215,8 +271,11 @@ static void load_config(void)
          * 注意超长行（> INI_MAX_LINE）是被截断后照常解析的，不是整行丢弃。 */
         int bad_line = 0;
         config_parse_string_ex(&g_config, text, &bad_line);   /* 内部先 set_defaults */
+        /* 热加载时先应用日志策略：关闭后本次 reload 不再多写尾巴，开启则立即生效。 */
+        apply_log_config(&g_config);
         if (bad_line > 0)
             HUA_LOG_W("配置第 %d 行解析有误（该行已跳过；也可能是行超长被截断）", bad_line);
+        log_config_diag(&g_config);
         hua_free(text);
         char *p8 = hua_utf16_to_utf8(g_ini_path);
         HUA_LOG_I("配置已加载：%d 个全局手势、%d 个程序覆盖（%s）",
@@ -225,6 +284,7 @@ static void load_config(void)
     } else {
         /* 文件读写都失败（极少见）：直接解析内置默认文本，保证手势可用。 */
         config_parse_string(&g_config, HUA_DEFAULT_INI);
+        apply_log_config(&g_config);
         HUA_LOG_W("无法读写配置文件，使用内置默认手势（%d 个）",
                   (int)g_config.gesture_count);
     }
@@ -295,14 +355,26 @@ static DWORD WINAPI watch_proc(LPVOID arg)
     ZeroMemory(&g_watch_fingerprint, sizeof(g_watch_fingerprint));
     watch_read_fingerprint(&g_watch_fingerprint);
 
-    while (!g_watch_stop) {
-        if (WaitForSingleObject(h, 300) == WAIT_OBJECT_0) {
-            /* 先重新挂起通知，再防抖，兼容编辑器“临时文件 + 重命名”保存流程。 */
-            FindNextChangeNotification(h);
-            Sleep(150);
-            if (!g_watch_stop && watch_ini_content_changed())
-                PostMessageW(g_hwnd, WM_HUA_RELOAD, 0, 0);
-        }
+    /*
+     * 同时等「目录有变化」与「该退了」，无超时。
+     *
+     * 此前是 WaitForSingleObject(h, 300) 轮询：这个进程 99.9% 的时间完全空闲，却
+     * 每秒醒 3.3 次，只为看一眼是否该停。改成等两个句柄后，空闲期零唤醒，
+     * 且 watch_stop 不再需要等满一整轮（WaitForSingleObject(300) + Sleep(150) + 读文件）。
+     */
+    HANDLE waits[2] = { h, g_watch_stop_evt };
+    for (;;) {
+        DWORD w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+        if (w != WAIT_OBJECT_0)
+            break;   /* 停止信号，或等待失败（句柄失效）——两种都该收摊 */
+
+        /* 先重新挂起通知，再防抖，兼容编辑器“临时文件 + 重命名”保存流程。
+         * 防抖期间也要能被叫醒退出，故用等停止事件代替 Sleep。 */
+        FindNextChangeNotification(h);
+        if (WaitForSingleObject(g_watch_stop_evt, 150) == WAIT_OBJECT_0)
+            break;
+        if (watch_ini_content_changed())
+            PostMessageW(g_hwnd, WM_HUA_RELOAD, 0, 0);
     }
     FindCloseChangeNotification(h);
     return 0;
@@ -322,8 +394,8 @@ static void watch_start(void)
         if (wcscmp(g_watch_path, g_ini_path) == 0)
             return;
         HUA_LOG_I("配置路径已变化，重启监听");
-        /* 旧线程没确认退出就不能重启：下面会覆写 g_watch_path 并把 g_watch_stop
-         * 清零，那等于复活旧线程的循环条件 —— 两个线程同时读写 g_watch_path /
+        /* 旧线程没确认退出就不能重启：下面会 ResetEvent 停止事件并覆写 g_watch_path，
+         * 那等于复活旧线程的等待条件 —— 两个线程同时读写 g_watch_path /
          * g_watch_fingerprint，还会重复投递重载。宁可维持现状。 */
         if (!watch_stop())
             return;
@@ -336,7 +408,19 @@ static void watch_start(void)
     if (!slash)
         return;
     slash[0] = L'\0';   /* 目录部分 */
-    g_watch_stop = 0;
+
+    /* 手动重置事件；复用同一个句柄，重启监听时先复位。 */
+    if (!g_watch_stop_evt) {
+        g_watch_stop_evt = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!g_watch_stop_evt) {
+            HUA_LOG_W("创建监听停止事件失败: %lu（热加载不可用，请用托盘「重载配置」）",
+                      GetLastError());
+            return;
+        }
+    } else {
+        ResetEvent(g_watch_stop_evt);
+    }
+
     g_watch_thread = CreateThread(NULL, 0, watch_proc, NULL, 0, NULL);
     if (!g_watch_thread)
         HUA_LOG_W("启动配置监听线程失败: %lu（热加载不可用，请用托盘「重载配置」）",
@@ -344,16 +428,17 @@ static void watch_start(void)
 }
 
 /* 停止监听线程。返回 true 表示已确认退出，可以安全重启；
- * false 表示线程还活着，调用方绝不能复位 g_watch_stop 或覆写 g_watch_path。 */
+ * false 表示线程还活着，调用方绝不能 ResetEvent 停止事件或覆写 g_watch_path。 */
 static bool watch_stop(void)
 {
     if (!g_watch_thread)
         return true;
-    InterlockedExchange(&g_watch_stop, 1);
-    /* 线程最长一轮 = WaitForSingleObject(300) + Sleep(150) + 读文件算指纹，
-     * 慢盘/网络盘上可能更久。等待超时就不能当它已经死了：此前的写法照样
-     * CloseHandle 并置 NULL，随后 watch_start 把 g_watch_stop 清零，等于把
-     * 旧线程的循环条件复活 → 双线程竞争 g_watch_path。 */
+    if (g_watch_stop_evt)
+        SetEvent(g_watch_stop_evt);   /* 立刻叫醒；线程不再需要等满一轮 */
+    /* 线程通常在毫秒级退出（等的是事件而非超时轮询），但读文件算指纹可能卡在
+     * 慢盘/网络盘上。等待超时就不能当它已经死了：此前的写法照样 CloseHandle 并
+     * 置 NULL，随后 watch_start 会 ResetEvent 停止事件，等于把旧线程的等待条件复活
+     * → 双线程竞争 g_watch_path。 */
     if (WaitForSingleObject(g_watch_thread, 5000) != WAIT_OBJECT_0) {
         HUA_LOG_W("配置监听线程未能退出，维持现状（不重启监听）");
         return false;   /* 句柄故意不关：线程仍在用它自己的状态 */
@@ -365,28 +450,12 @@ static bool watch_stop(void)
 
 /* ---------------- 开机自启 ---------------- */
 
-/* s 是已跳过前导空白的行首。判定是否为 [General] 节头。 */
-static bool ini_line_is_general(const char *s)
-{
-    return _strnicmp(s, "[General]", 9) == 0;
-}
-
-/* 判定是否为 AutoStart 键行。整键匹配：只比前缀会把 AutoStartFoo=1 也改写掉。 */
-static bool ini_line_is_autostart(const char *s)
-{
-    if (_strnicmp(s, "AutoStart", 9) != 0)
-        return false;
-    const char *p = s + 9;
-    while (*p == ' ' || *p == '\t')
-        p++;
-    return *p == '=';
-}
-
-/* 把 ini 里的 AutoStart 行写回为 enable（按行替换，尽量保留其余内容）。
+/* 把 ini 里的 AutoStart 行写回为 enable。
  *
- * 写临时文件 + 原子替换，且检查每一次写入，绝不先截断原文件。但要注意：原子替换
- * 只能防「写失败」，防不住「成功地写入了截断内容」——所以下面还必须先确认整份内容
- * 都能被按 C 字符串安全遍历（见嵌入 NUL 的检查），否则照样会毁掉用户的配置。 */
+ * 纯文本变换（分节、就地替换/插入/补节、嵌入 NUL 防护）已抽到 ini_edit.c 并单测；
+ * 这里只剩「读文件 → 变换 → 写临时文件 → 原子替换」的 IO 外壳。原子替换只能防
+ * 「写失败」，防不住「成功地写入了截断内容」，故变换那步在拿不准输入时会返回失败
+ * （见 ini_set_autostart），绝不产出会毁掉用户配置的半截内容。 */
 static void ini_write_autostart(bool enable)
 {
     if (!g_ini_path[0])
@@ -396,15 +465,21 @@ static void ini_write_autostart(bool enable)
     if (!text)
         return;
 
-    /*
-     * 含嵌入 NUL（典型是被记事本「另存为 Unicode」存成了 UTF-16）：下面按 strchr/
-     * strlen 逐行遍历会在第一个 NUL 处就停下，于是「成功」写出一份只剩几个字节的
-     * 文件并原子替换掉原配置——用户整份手势表静默永久丢失。宁可不改。
-     */
-    if (len != strlen(text)) {
-        HUA_LOG_W("配置含嵌入 NUL（疑似 UTF-16 编码），拒绝改写以免丢失内容；"
-                  "请将 hua.ini 另存为 UTF-8。自启开关未写回文件。");
+    /* 变换可能变长（插入一行或补一整节）；给足余量，不足则 ini_set_autostart 返回
+     * 失败而非截断。in_len*2 覆盖「每行都命中并被替换而变长」的病态上界。 */
+    size_t cap = len * 2 + 64;
+    char *out = malloc(cap);
+    if (!out) {
         hua_free(text);
+        HUA_LOG_W("写自启配置失败：内存不足（原配置未动）");
+        return;
+    }
+    size_t n = ini_set_autostart(text, len, enable, out, cap);
+    hua_free(text);
+    if (n == HUA_INI_EDIT_FAIL) {
+        free(out);
+        HUA_LOG_W("拒绝改写自启开关：配置疑似含嵌入 NUL（UTF-16 编码）；"
+                  "请将 hua.ini 另存为 UTF-8。自启开关未写回文件。");
         return;
     }
 
@@ -417,91 +492,24 @@ static void ini_write_autostart(bool enable)
     wchar_t tmp[MAX_PATH];
     int tn = _snwprintf(tmp, MAX_PATH, L"%s.tmp", g_ini_path);
     if (tn < 0 || tn >= MAX_PATH) {
+        free(out);
         HUA_LOG_W("配置路径过长，无法构造临时文件（原配置未动）");
-        hua_free(text);
         return;
     }
     tmp[MAX_PATH - 1] = L'\0';
 
     FILE *fp = _wfopen(tmp, L"wb");
     if (!fp) {
+        free(out);
         HUA_LOG_W("写自启配置失败：无法创建临时文件（原配置未动）");
-        hua_free(text);
         return;
     }
 
-    const char *val = enable ? "true" : "false";
-    bool ok = true;
-
-    /*
-     * 先扫一遍：[General] 里到底有没有 AutoStart 行。
-     * 必须带「节」的概念——AutoStart 只属于 [General]。若把它追加到文件末尾，
-     * 那里通常是最后一个 [App:xxx] 节（内置默认配置就以 [App:msedge.exe] 结尾），
-     * 于是这行会被解析成该程序的一条垃圾手势，开关永不生效；用户再点一次又追加
-     * 一行，ini 与垃圾手势逐次累积。
-     */
-    bool have_autostart = false;
-    {
-        bool in_gen = false;
-        char *l = text;
-        while (*l) {
-            char *e = strchr(l, '\n');
-            char *s = l;
-            while (*s == ' ' || *s == '\t')
-                s++;
-            if (*s == '[')
-                in_gen = ini_line_is_general(s);
-            else if (in_gen && ini_line_is_autostart(s)) {
-                have_autostart = true;
-                break;
-            }
-            if (!e)
-                break;
-            l = e + 1;
-        }
-    }
-
-    bool in_gen = false;
-    bool inserted = false;
-    char *line = text;
-    while (*line && ok) {
-        char *eol = strchr(line, '\n');
-        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
-        char *s = line;
-        while (*s == ' ' || *s == '\t')
-            s++;
-        bool is_hdr = (*s == '[');
-        if (is_hdr)
-            in_gen = ini_line_is_general(s);
-
-        if (in_gen && !is_hdr && have_autostart && ini_line_is_autostart(s)) {
-            ok = fprintf(fp, "AutoStart       = %s\r\n", val) > 0;   /* 就地替换 */
-        } else {
-            if (line_len > 0 && fwrite(line, 1, line_len, fp) != line_len)   /* 含行尾 \r */
-                ok = false;
-            if (ok && eol && fputc('\n', fp) == EOF)
-                ok = false;
-            /* 原文件没有该键：紧跟在 [General] 头之后插入，而不是丢到文件末尾。 */
-            if (ok && is_hdr && in_gen && !have_autostart && !inserted) {
-                if (!eol && fputc('\n', fp) == EOF)   /* 头恰是最后一行且无换行 */
-                    ok = false;
-                if (ok)
-                    ok = fprintf(fp, "AutoStart       = %s\r\n", val) > 0;
-                inserted = true;
-            }
-        }
-        if (!eol)
-            break;
-        line = eol + 1;
-    }
-    /* 整份 ini 连 [General] 节都没有：补一个完整的节，而非裸键追加到末尾。 */
-    if (ok && !have_autostart && !inserted)
-        ok = fprintf(fp, "\r\n[General]\r\nAutoStart       = %s\r\n", val) > 0;
-
+    bool ok = fwrite(out, 1, n, fp) == n;
+    free(out);
     /* 缓冲数据要到 fclose 才真正落盘，这里的失败不能漏检。 */
     if (fclose(fp) != 0)
         ok = false;
-    hua_free(text);
 
     if (!ok) {
         _wremove(tmp);
@@ -518,10 +526,19 @@ static void ini_write_autostart(bool enable)
 static void autostart_reconcile(void)
 {
     bool exists = autostart_exists();
+    /* 失败必须留痕：此前两个分支都只有 if 没有 else，对账失败是彻底静默的——
+     * 用户看到的是「开机自启就是不工作」，日志里一个字都没有。
+     * （具体原因由 autostart.c 的 run_hidden 记录，这里只说结论。） */
     if (g_config.auto_start && !exists) {
-        if (autostart_set(true)) HUA_LOG_I("已创建开机自启任务");
+        if (autostart_set(true))
+            HUA_LOG_I("已创建开机自启任务");
+        else
+            HUA_LOG_W("创建开机自启任务失败，开机不会自动启动（原因见上一条）");
     } else if (!g_config.auto_start && exists) {
-        if (autostart_set(false)) HUA_LOG_I("已移除开机自启任务");
+        if (autostart_set(false))
+            HUA_LOG_I("已移除开机自启任务");
+        else
+            HUA_LOG_W("移除开机自启任务失败，开机仍会自动启动（原因见上一条）");
     }
 }
 
@@ -600,6 +617,7 @@ static void tray_show_menu(HWND hwnd)
     AppendMenuW(menu, MF_STRING | (g_config.auto_start ? MF_CHECKED : MF_UNCHECKED),
                 IDM_AUTOSTART, L"开机自启");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, IDM_UPDATE,   L"检查更新");
     AppendMenuW(menu, MF_STRING, IDM_PROJECT,  L"项目地址");
     AppendMenuW(menu, MF_STRING, IDM_EXIT,     L"退出");
 
@@ -655,7 +673,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             g_active_has_exe = window_exe_lower(hook_last_target(),
                                                 g_active_exe, sizeof(g_active_exe));
             overlay_begin();
-            SetTimer(hwnd, TIMER_FRAME, 16, NULL);   /* ~60 FPS */
+            /* 失败必须留痕：这个定时器是手势的心跳——轮询光标、驱动浮层、跑停顿超时
+             * 自愈。它没起来，手势就会卡在非 IDLE 态，而 TIMER_WATCHDOG 的重装恰恰
+             * 被 hook_is_idle() 挡住 → 探活永久失效、手势整个会话静默死掉。
+             * （TIMER_WATCHDOG 一直是判了返回值的，这里此前没判，不一致。） */
+            if (!SetTimer(hwnd, TIMER_FRAME, 16, NULL))   /* ~60 FPS */
+                HUA_LOG_E("启动手势帧计时器失败: %lu（本次手势将无轨迹且不会超时自愈）",
+                          GetLastError());
         } else if (wParam == HUA_EV_GESTURE_CANCEL) {
             KillTimer(hwnd, TIMER_FRAME);
             overlay_end();
@@ -666,9 +690,20 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
             const Pt *ended_pts = NULL;
             size_t ended_n = hook_snapshot(&ended_pts);
-            bool had_trail = ended_n >= 2;
             const char *seq = hook_last_seq();
             HWND target = hook_last_target();
+            /*
+             * had_trail 要回答的是「用户到底划出东西了没有」——划出来了就认这是手势
+             * （失败也算），没划出来就是一次普通点击，得把原生右键还回去。
+             *
+             * 「点数 >= 2」是个坏代理：状态机在 TriggerDistance(5px) 就进 Active，而
+             * rec_encode 要到 MinDistance(20px) 才分出第一段。中间这段死区里只要采到
+             * 2 个点（StepDistance=12px，手抖一下就够），had_trail 就为真 —— 于是
+             * Down 和 Up 双双被吞，用户只是想点个右键，菜单却凭空消失，且「有没有菜单」
+             * 取决于抖动幅度够不够采到第 2 个点，完全是随机的。
+             * 真正的判据是「产出了方向段没有」：空串 = 什么都没划出来 = 普通点击。
+             */
+            bool had_trail = ended_n >= 2 && seq[0] != '\0';
             const char *action = config_resolve(&g_config,
                                                 g_active_has_exe ? g_active_exe : NULL, seq);
 
@@ -701,6 +736,27 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             } else {
                 HUA_LOG_I("手势 \"%s\" → 未匹配%s", seq,
                           had_trail ? "（已有轨迹，不补发右键）" : "");
+                /*
+                 * 划出了轨迹却没匹配上：把原始采样点原样打出来。
+                 * 方向串本身不足以复现问题——它是 rec_encode 的产物，看到 "26969696"
+                 * 也无从知道用户到底画了什么、编码在哪一步跑偏。没有原始点，就只能拿
+                 * 合成轨迹猜真实输入，而合成参数（采样密度、手势尺寸）一旦与实际不符，
+                 * 得到的"验证通过"是假的。这行日志就是为了不再靠猜。
+                 */
+                if (had_trail && ended_pts) {
+                    char pbuf[900];
+                    size_t used = 0;
+                    for (size_t i = 0; i < ended_n && used + 24 < sizeof(pbuf); i++) {
+                        int w = snprintf(pbuf + used, sizeof(pbuf) - used, "%s%d,%d",
+                                         i ? " " : "", ended_pts[i].x, ended_pts[i].y);
+                        if (w < 0)
+                            break;
+                        used += (size_t)w;
+                    }
+                    pbuf[used] = '\0';
+                    HUA_LOG_I("  未匹配轨迹原始点：n=%zu min_dist=%d step=%d [%s]",
+                              ended_n, g_config.min_distance, g_config.step_distance, pbuf);
+                }
                 /* 只有从未形成可见轨迹时才允许还原；长轨迹失败也属于手势。 */
                 if (g_config.restore_event && !had_trail)
                     hook_replay_trigger_click();
@@ -746,6 +802,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 rec_encode(timed_out_pts, timed_out_n, g_config.min_distance,
                            partial_seq, sizeof(partial_seq));
 
+                /*
+                 * 空串 = 一个方向段都没划出来 = 用户只是按住触发键不动想了一下。
+                 * 手抖 TriggerDistance(5px) 就足以把状态推进 ST_ACTIVE，于是 Down 被吞、
+                 * Up 也被吞，这次右键凭空消失、菜单永远不弹（已在实机日志中复现：
+                 * 位移 5.4px、点数 1，照样判超时并吞掉右键）。
+                 * 与 END 路径同一条规则：没划出方向段就还原原生点击，是否还原同样交给
+                 * RestoreEvent。真划出了东西再超时（如画了「2」然后发呆），仍按手势处理、
+                 * 不补发。
+                 */
+                bool drew_nothing = (partial_seq[0] == '\0');
+                if (drew_nothing && g_config.restore_event)
+                    hook_arm_replay_on_up();
+
                 char target_exe[CFG_MAX_EXE], down_exe[CFG_MAX_EXE];
                 char current_exe[CFG_MAX_EXE];
                 /*
@@ -773,9 +842,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                                   current_title, sizeof(current_title));
 #endif
 
-                HUA_LOG_I("手势停顿超时：idle=%llums 达到 PauseTimeout=%lums，已按配置取消且不补发触发键；trigger=%s，轨迹=%s，点数=%zu，起点=(%d,%d)，末点=(%d,%d)，当前光标=(%d,%d)",
+                HUA_LOG_I("手势停顿超时：idle=%llums 达到 PauseTimeout=%lums，已取消；%s；trigger=%s，轨迹=%s，点数=%zu，起点=(%d,%d)，末点=(%d,%d)，当前光标=(%d,%d)",
                           (unsigned long long)timeout_info.idle_ms,
                           (unsigned long)timeout_info.timeout_ms,
+                          drew_nothing
+                              ? (g_config.restore_event
+                                     ? "未划出方向段，视同普通点击，将在松手时补发触发键"
+                                     : "未划出方向段，但 RestoreEvent=false，不补发触发键")
+                              : "已划出方向段，按手势处理，不补发触发键",
                           trigger_name(g_config.trigger),
                           partial_seq[0] ? partial_seq : "?", timeout_info.point_count,
                           timeout_info.start.x, timeout_info.start.y,
@@ -829,11 +903,21 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 ini_write_autostart(enable);   /* 持久化到 ini */
                 HUA_LOG_I("开机自启：%s", enable ? "开" : "关");
             } else {
-                MessageBoxW(hwnd, L"设置开机自启失败（需要管理员权限）。",
+                /* 原文案断言「需要管理员权限」——本程序 manifest 已是
+                 * requireAdministrator，权限恰恰是最不可能的原因，那句话只会把用户
+                 * 的排查引向死胡同。真实原因（schtasks 退出码/错误码）已由
+                 * autostart.c 记进日志，这里如实指过去。 */
+                MessageBoxW(hwnd,
+                            L"设置开机自启失败。\n\n"
+                            L"常见原因：任务计划程序服务被禁用，或被组策略/安全软件拦截。\n"
+                            L"详细错误码见 hua.log。",
                             HUA_APP_NAME, MB_OK | MB_ICONWARNING);
             }
             break;
         }
+        case IDM_UPDATE:
+            update_check_now(hwnd, &g_config);
+            break;
         case IDM_PROJECT:
             ShellExecuteW(NULL, L"open", HUA_PROJECT_URL, NULL, NULL, SW_SHOWNORMAL);
             break;
@@ -841,6 +925,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             DestroyWindow(hwnd);
             break;
         }
+        return 0;
+
+    case WM_HUA_UPDATE:
+        update_on_found_message(hwnd);
         return 0;
 
     case WM_DESTROY:
@@ -860,6 +948,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)nShowCmd;
     g_hinst = hInstance;
 
+    /* 若本次是自动更新后的重启：先等旧进程退出、清理 .old 残留，【必须早于下面的
+     * CreateMutexW】。否则旧进程尚未释放互斥量，新进程会误判「已在运行」而退出，
+     * 结果一个实例都不剩。见 update.c / updater 库的单实例握手说明。 */
+    update_boot();
+
     /* 单实例：命名互斥量。已存在则前置提示并退出。 */
     HANDLE mutex = CreateMutexW(NULL, TRUE, HUA_MUTEX_NAME);
     if (!mutex) {
@@ -875,6 +968,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         return 0;
     }
 
+    configure_log_before_init();
     hua_log_init();
 
     /* 注册并创建不可见的顶层窗口（无可见 UI，但能跑消息循环 + 收托盘/钩子/广播消息）。 */
@@ -943,6 +1037,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         HUA_LOG_W("启动钩子探活计时器失败: %lu（钩子失效后将无法自动恢复）",
                   GetLastError());
     HUA_LOG_I("hua 就绪（识别闭环 + per-app 门控 + 浮层 + 热加载）");
+
+    /* 启动时后台静默检查更新（受 [Update] Enabled/AutoCheck 控制）。发现新版仅弹气泡。 */
+    update_start_background_check(g_hwnd, &g_config);
 
     /* 消息循环 */
     MSG m;

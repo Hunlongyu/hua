@@ -1,0 +1,161 @@
+name: Release
+
+# 推送形如 v1.0.9 的标签时：三架构（x64 / x86 / ARM64）编译 + 测试 + 校验，
+# 打包单文件 exe 与 zip，从 CHANGELOG.md 抽出本版说明，一次性发布到 GitHub Release。
+# 含连字符的标签（v1.0.9-beta.1）标记为预发布，只有 beta 通道用户能收到。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            cmake_arch: x64
+            label: win-x64
+          - arch: x86
+            cmake_arch: Win32
+            label: win-x86
+          - arch: arm64
+            cmake_arch: ARM64
+            label: win-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify tag matches version.h
+        shell: bash
+        # 版本号单一来源是 src/version.h，updater 编译进的也是它。tag 与之不一致会发出
+        # 「文件名写新版、exe 里却是旧版」的错包，导致自动更新反复触发。此处强制对齐。
+        run: |
+          getver() { grep -E "^#define $1 " src/version.h | grep -oE '[0-9]+' | head -1; }
+          hver="$(getver HUA_VER_MAJOR).$(getver HUA_VER_MINOR).$(getver HUA_VER_PATCH)"
+          tag="${GITHUB_REF_NAME}"          # v1.0.9 或 v1.0.9-beta.1
+          base="${tag#v}"; base="${base%%-*}"   # 去 v、去预发布后缀 → 1.0.9
+          if [ "$base" != "$hver" ]; then
+            echo "::error::标签 $tag 的版本 $base 与 src/version.h（$hver）不一致；请先同步 version.h 再打标签"
+            exit 1
+          fi
+          echo "版本对齐 OK：tag=$tag，version.h=$hver"
+
+      - name: Configure (MSVC ${{ matrix.arch }})
+        run: cmake -S . -B build -A ${{ matrix.cmake_arch }}
+
+      - name: Build (Release)
+        run: cmake --build build --config Release
+
+      - name: Test (ctest)
+        # 测试不过就不发版；ARM64 产物无法在 x64 runner 执行，只做编译校验
+        if: matrix.arch != 'arm64'
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Verify runtime deps + PE arch
+        shell: pwsh
+        run: |
+          $exe = "build/Release/hua.exe"
+          $dumpbin = (Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio" -Recurse -Filter dumpbin.exe -EA SilentlyContinue |
+                      Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1).FullName
+          $bad = & $dumpbin /dependents $exe | Select-String -Pattern 'VCRUNTIME|api-ms-win-crt'
+          if ($bad) { $bad; throw "产物仍依赖 VC++ 运行库，违反零依赖约定" }
+          $b = [IO.File]::ReadAllBytes($exe)
+          $m = [BitConverter]::ToUInt16($b, [BitConverter]::ToInt32($b, 0x3C) + 4)
+          $want = switch ("${{ matrix.arch }}") { "x64" { 0x8664 } "x86" { 0x14C } "arm64" { 0xAA64 } }
+          if ($m -ne $want) { throw "架构不符：期望 0x$($want.ToString('X4'))，实际 0x$($m.ToString('X4'))" }
+          Write-Host "零依赖 + 架构 0x$($m.ToString('X4')) OK"
+
+      - name: Package (${{ matrix.arch }})
+        shell: pwsh
+        run: |
+          $ref = "${{ github.ref_name }}"     # v1.0.9（已校验 == version.h）
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build/Release/hua.exe dist/
+          Copy-Item config/hua.ini dist/
+          # 许可证必须随二进制分发：hua.exe 内联编译了 inih（BSD-3-Clause）与
+          # winautoupdate（MIT，含 cJSON/semver）。二进制分发需重现各自版权与免责条款。
+          Copy-Item LICENSE dist/
+          Copy-Item third_party/inih-LICENSE.txt dist/
+          Copy-Item third_party/updater/LICENSE dist/updater-LICENSE.txt
+          # 自动更新走单文件 exe 模式：x64 资产名须匹配 hua 内置 glob "hua-*-x64.exe"，
+          # 且该 glob 在一个 Release 内只能命中唯一一个（x86/arm64 结尾不同，zip 非 .exe）。
+          Copy-Item build/Release/hua.exe "hua-$ref-${{ matrix.arch }}.exe"
+          # 完整包（含默认配置与许可证），供全新安装。
+          Compress-Archive -Path dist/* -DestinationPath "hua-$ref-${{ matrix.label }}.zip" -Force
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hua-${{ matrix.arch }}
+          path: |
+            hua-${{ github.ref_name }}-${{ matrix.arch }}.exe
+            hua-${{ github.ref_name }}-${{ matrix.label }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 创建 Release / 上传附件
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4   # 需要 CHANGELOG.md
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts   # 各架构落到 artifacts/hua-<arch>/
+
+      - name: Build release notes
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          base="${tag#v}"; base="${base%%-*}"
+          BASE="https://github.com/${REPO}/releases/download/${tag}"
+          # 从 CHANGELOG.md 抽出本版章节，作为 Release 正文——updater 手动更新弹窗会展示它。
+          # 用字面量 index() 匹配节头，不用动态正则：gawk 会把动态正则里的 \[ 当成字符类
+          # 元字符而非字面 [，导致节头匹配不上、正文静默丢失（已实测）。
+          section=$(awk -v hdr="## [$base]" '
+            index($0, hdr) == 1 {f=1; next}
+            f && /^## \[/ {exit}
+            f {print}
+          ' CHANGELOG.md)
+          {
+            echo '## 下载'
+            echo
+            echo '| 架构 | 单文件 exe | 压缩包 | 适用系统 |'
+            echo '|:---:|:---|:---|:---|'
+            echo "| **x64** | [hua-${tag}-x64.exe](${BASE}/hua-${tag}-x64.exe) | [zip](${BASE}/hua-${tag}-win-x64.zip) | 64 位 Windows 10/11（推荐） |"
+            echo "| **x86** | [hua-${tag}-x86.exe](${BASE}/hua-${tag}-x86.exe) | [zip](${BASE}/hua-${tag}-win-x86.zip) | 32 位 Windows |"
+            echo "| **ARM64** | [hua-${tag}-arm64.exe](${BASE}/hua-${tag}-arm64.exe) | [zip](${BASE}/hua-${tag}-win-arm64.zip) | ARM 设备（Surface Pro X 等），原生运行 |"
+            echo
+            echo 'exe 单文件下载即用（需管理员权限）；zip 内含默认 `hua.ini` 与许可证。'
+            echo
+            echo '## 更新内容'
+            echo
+            if [ -n "$section" ]; then
+              echo "$section"
+            else
+              echo "详见 [CHANGELOG.md](https://github.com/${REPO}/blob/main/CHANGELOG.md)。"
+            fi
+          } > NOTES.md
+          cat NOTES.md
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # 含连字符的标签标记为预发布。若 Release 已存在则改为更新说明并覆盖附件。
+        run: |
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease";; esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "hua $GITHUB_REF_NAME" --notes-file NOTES.md $prerelease \
+            artifacts/*/* \
+          || { gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file NOTES.md; \
+               gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" artifacts/*/* --clobber; }

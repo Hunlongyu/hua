@@ -55,11 +55,27 @@ target_include_directories(hua_inih PUBLIC third_party)
 # PUBLIC：inih 是头文件里的 #ifdef 开关，消费者（config.c）编译时也必须看到同一定义。
 target_compile_definitions(hua_inih PUBLIC INI_ALLOW_MULTILINE=0)
 
+# -------- 第三方 winautoupdate（自动更新库，源码内联）--------
+# 来源见 third_party/updater/VENDOR.md。独立 target：vendored 代码不受本项目 /W4 影响，
+# 也不为 cJSON/semver 的既有告警改上游源码。仅链接 winhttp + bcrypt（系统库，非 VC 运行库，
+# 不违反零依赖约定）。继承目录级的静态 CRT 设置（CMAKE_MSVC_RUNTIME_LIBRARY）。
+file(GLOB HUA_UPDATER_SRC
+  third_party/updater/src/*.c
+  third_party/updater/src/third_party/*.c
+)
+add_library(hua_updater STATIC ${HUA_UPDATER_SRC})
+target_include_directories(hua_updater
+  PUBLIC  third_party/updater/include
+  PRIVATE third_party/updater/src
+)
+target_link_libraries(hua_updater PUBLIC winhttp bcrypt)
+
 # -------- 纯逻辑静态库（主程序与测试共用，零 Win32 依赖）--------
 add_library(hua_core STATIC
   src/recognizer.c
   src/config.c
   src/watchdog.c
+  src/ini_edit.c
 )
 target_include_directories(hua_core PUBLIC src)
 target_link_libraries(hua_core PRIVATE hua_inih hua_warnings)
@@ -74,11 +90,12 @@ add_executable(hua WIN32
   src/overlay.c
   src/autostart.c
   src/platform.c
+  src/update.c
   src/hua.rc
 )
 
 target_include_directories(hua PRIVATE src)   # 同时供 windres 找到 app.manifest
-target_link_libraries(hua PRIVATE hua_core gdiplus)
+target_link_libraries(hua PRIVATE hua_core hua_updater gdiplus)
 
 # 注：MinGW 本地构建时链接器会警告 "multiple non-default manifests"——因为
 # gcc 驱动对 exe 无条件链入自带的 default-manifest.o，与我们 RC 里的 manifest
@@ -112,6 +129,12 @@ target_link_libraries(test_watchdog PRIVATE hua_core hua_warnings)
 target_include_directories(test_watchdog PRIVATE third_party)
 add_test(NAME watchdog COMMAND test_watchdog)
 
+# ini AutoStart 改写测试（ini_edit.c 在 hua_core 内，纯文本变换无 Win32 依赖）。
+add_executable(test_ini_edit tests/test_ini_edit.c)
+target_link_libraries(test_ini_edit PRIVATE hua_core hua_warnings)
+target_include_directories(test_ini_edit PRIVATE third_party)
+add_test(NAME ini_edit COMMAND test_ini_edit)
+
 # config 解析测试（config.c 在 hua_core 内）。
 add_executable(test_config tests/test_config.c)
 target_link_libraries(test_config PRIVATE hua_core hua_warnings)
@@ -121,3 +144,12 @@ if(MSVC)
   target_link_options(test_config PRIVATE /STACK:4194304)
 endif()
 add_test(NAME config COMMAND test_config)
+
+# 日志轮转测试必须与正式 hua.exe 隔离目录，避免测试改写用户正在查看的 hua.log。
+add_executable(test_logging tests/test_logging.c src/platform.c)
+target_include_directories(test_logging PRIVATE src third_party)
+target_link_libraries(test_logging PRIVATE user32 shell32 hua_warnings)
+set_target_properties(test_logging PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/log-test"
+)
+add_test(NAME logging COMMAND test_logging)

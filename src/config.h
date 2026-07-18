@@ -21,6 +21,19 @@ typedef enum {
     CFG_FILTER_WHITELIST,
 } CfgFilterMode;
 
+typedef enum {
+    CFG_CHANNEL_STABLE = 0,  /* 只跟正式版 */
+    CFG_CHANNEL_BETA,        /* 也接收预发布版（beta/rc） */
+} CfgUpdateChannel;
+
+/* 数值顺序与 HuaLogLevel 保持一致，便于主程序无损映射；config 模块仍零 Win32 依赖。 */
+typedef enum {
+    CFG_LOG_INFO = 0,
+    CFG_LOG_WARN,
+    CFG_LOG_ERROR,
+    CFG_LOG_OFF,
+} CfgLogLevel;
+
 #define CFG_MAX_KEY          16
 #define CFG_MAX_ACTION       256
 /* Tolerance 上界。实际手势模板都是 1~4 个方向，容错再大只会让任意手势都命中最短
@@ -44,6 +57,21 @@ typedef struct {
     size_t  gesture_count;
 } AppConfig;
 
+/*
+ * 解析诊断：纯计数，零 Win32 依赖。
+ *
+ * 本模块不能自己打日志（要保持可脱离系统单测），故把「解析时默默咽下去的问题」
+ * 攒在这里交回调用方。理由与 config_parse_string_ex 的 out_bad_line 完全相同：
+ * 静默跳过会让用户的手势莫名不生效而无从排查。此前三类问题都绕开了那个通道——
+ * 容量溢出、[General] 未知键、无法解析的布尔值。
+ */
+typedef struct {
+    int  dropped;         /* 因容量上限被丢弃的条目数（全局手势 / [App:] 节 / app 内手势） */
+    int  unknown_keys;    /* [General] 中无法识别的键数（多为拼写错误） */
+    int  bad_values;      /* 值无法解析、已回落到文档默认值的键数 */
+    char first_issue[CFG_MAX_KEY * 2];   /* 首个出问题的键名，便于用户定位；无则为空串 */
+} CfgDiag;
+
 typedef struct {
     /* [General] —— 触发与识别 */
     CfgTrigger    trigger;
@@ -56,6 +84,12 @@ typedef struct {
     bool          disable_on_fullscreen;
     bool          auto_start;
     bool          restore_event;     /* 未形成可见轨迹的识别失败是否补发原生按键 */
+
+    /* [General] —— 日志 */
+    bool          log_enabled;
+    CfgLogLevel   log_level;         /* off | error | warn | info */
+    int           log_max_size_mb;   /* 当前日志达到此体积后轮转 */
+    int           log_retention_days;/* 删除超过此天数的轮转日志 */
 
     /* [General] —— 浮层外观（overlay/M5 消费） */
     bool          show_trail;
@@ -72,6 +106,11 @@ typedef struct {
     int           text_outline_width;/* OSD 文字描边宽度（px） */
     int           text_letter_spacing;/* OSD 文字字间距（px） */
 
+    /* [Update] —— 自动更新 */
+    bool             update_enabled;    /* 总开关（false = 从不联网检查） */
+    bool             update_auto_check; /* 启动时后台静默检查（发现新版仅提示） */
+    CfgUpdateChannel update_channel;    /* stable | beta */
+
     /* [Gestures] 全局 */
     Gesture gestures[CFG_MAX_GESTURES];
     size_t  gesture_count;
@@ -79,6 +118,9 @@ typedef struct {
     /* [App:xxx] */
     AppConfig apps[CFG_MAX_APPS];
     size_t    app_count;
+
+    /* 解析诊断（见 CfgDiag）。 */
+    CfgDiag diag;
 } Config;
 
 /* 以推荐默认值初始化。 */

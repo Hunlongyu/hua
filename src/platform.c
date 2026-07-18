@@ -3,6 +3,8 @@
  */
 #include "platform.h"
 
+#include "version.h"
+
 /* INITGUID 让 FOLDERID_* 的 GUID 在本 TU 内实体化，免去链接 uuid.lib。 */
 #define INITGUID
 #include <initguid.h>
@@ -18,6 +20,12 @@
 static FILE            *g_log_fp;
 static CRITICAL_SECTION g_log_cs;
 static bool             g_log_ready;
+static HuaLogLevel      g_log_min_level = HUA_LOG_WARN;
+static unsigned long long g_log_max_bytes = 10ULL * 1024ULL * 1024ULL;
+static int              g_log_retention_days = 2;
+static unsigned long long g_log_bytes;
+static wchar_t          g_log_dir[MAX_PATH];
+static wchar_t          g_log_path[MAX_PATH];
 
 static const char *level_str(HuaLogLevel level)
 {
@@ -29,6 +37,159 @@ static const char *level_str(HuaLogLevel level)
     }
 }
 
+static void write_log_bom_locked(void)
+{
+    if (!g_log_fp)
+        return;
+    static const unsigned char bom[3] = {0xEF, 0xBB, 0xBF};
+    if (fwrite(bom, 1, sizeof(bom), g_log_fp) == sizeof(bom))
+        g_log_bytes = sizeof(bom);
+}
+
+static bool open_log_in_dir_locked(const wchar_t *dir)
+{
+    wchar_t path[MAX_PATH];
+    _snwprintf(path, MAX_PATH, L"%shua.log", dir);
+    path[MAX_PATH - 1] = L'\0';
+
+    FILE *fp = _wfopen(path, L"ab");
+    if (!fp)
+        return false;
+
+    g_log_fp = fp;
+    wcsncpy(g_log_dir, dir, MAX_PATH - 1);
+    g_log_dir[MAX_PATH - 1] = L'\0';
+    wcsncpy(g_log_path, path, MAX_PATH - 1);
+    g_log_path[MAX_PATH - 1] = L'\0';
+
+    _fseeki64(g_log_fp, 0, SEEK_END);
+    __int64 pos = _ftelli64(g_log_fp);
+    g_log_bytes = pos > 0 ? (unsigned long long)pos : 0;
+    if (g_log_bytes == 0)
+        write_log_bom_locked();
+    return true;
+}
+
+static bool open_log_locked(void)
+{
+    wchar_t dir[MAX_PATH];
+    if (hua_exe_dir(dir, MAX_PATH) && open_log_in_dir_locked(dir))
+        return true;
+    if (hua_appdata_dir(dir, MAX_PATH) && open_log_in_dir_locked(dir))
+        return true;
+    return false;
+}
+
+/* 删除形如 hua-YYYYMMDD-HHMMSS-mmm.log 的过期轮转文件；当前 hua.log 永不误删。 */
+static void cleanup_old_logs_locked(void)
+{
+    if (!g_log_dir[0] || g_log_retention_days <= 0)
+        return;
+
+    wchar_t pattern[MAX_PATH];
+    _snwprintf(pattern, MAX_PATH, L"%shua-*.log", g_log_dir);
+    pattern[MAX_PATH - 1] = L'\0';
+
+    FILETIME now_ft;
+    GetSystemTimeAsFileTime(&now_ft);
+    ULARGE_INTEGER now;
+    now.LowPart = now_ft.dwLowDateTime;
+    now.HighPart = now_ft.dwHighDateTime;
+    const unsigned long long day_ticks = 24ULL * 60ULL * 60ULL * 10000000ULL;
+    const unsigned long long max_age = (unsigned long long)g_log_retention_days * day_ticks;
+
+    WIN32_FIND_DATAW fd;
+    HANDLE find = FindFirstFileW(pattern, &fd);
+    if (find == INVALID_HANDLE_VALUE)
+        return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+        ULARGE_INTEGER modified;
+        modified.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+        modified.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+        if (now.QuadPart > modified.QuadPart && now.QuadPart - modified.QuadPart > max_age) {
+            wchar_t path[MAX_PATH];
+            _snwprintf(path, MAX_PATH, L"%s%s", g_log_dir, fd.cFileName);
+            path[MAX_PATH - 1] = L'\0';
+            DeleteFileW(path);
+        }
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+}
+
+static bool rotate_log_locked(const SYSTEMTIME *st)
+{
+    if (!g_log_fp || !g_log_path[0] || !g_log_dir[0])
+        return false;
+
+    fclose(g_log_fp);
+    g_log_fp = NULL;
+
+    wchar_t archived[MAX_PATH];
+    _snwprintf(archived, MAX_PATH,
+               L"%shua-%04u%02u%02u-%02u%02u%02u-%03u.log", g_log_dir,
+               st->wYear, st->wMonth, st->wDay,
+               st->wHour, st->wMinute, st->wSecond, st->wMilliseconds);
+    archived[MAX_PATH - 1] = L'\0';
+
+    if (!MoveFileExW(g_log_path, archived, MOVEFILE_REPLACE_EXISTING)) {
+        g_log_fp = _wfopen(g_log_path, L"ab");
+        if (g_log_fp) {
+            _fseeki64(g_log_fp, 0, SEEK_END);
+            __int64 pos = _ftelli64(g_log_fp);
+            g_log_bytes = pos > 0 ? (unsigned long long)pos : 0;
+        }
+        return false;
+    }
+
+    g_log_fp = _wfopen(g_log_path, L"wb");
+    g_log_bytes = 0;
+    if (g_log_fp)
+        write_log_bom_locked();
+    cleanup_old_logs_locked();
+    return g_log_fp != NULL;
+}
+
+void hua_log_configure(HuaLogLevel min_level, int max_size_mb, int retention_days)
+{
+    if (min_level < HUA_LOG_INFO || min_level > HUA_LOG_OFF)
+        min_level = HUA_LOG_WARN;
+    if (max_size_mb < 1)
+        max_size_mb = 10;
+    if (retention_days < 1)
+        retention_days = 2;
+
+    if (!g_log_ready) {
+        g_log_min_level = min_level;
+        g_log_max_bytes = (unsigned long long)max_size_mb * 1024ULL * 1024ULL;
+        g_log_retention_days = retention_days;
+        return;
+    }
+
+    EnterCriticalSection(&g_log_cs);
+    g_log_min_level = min_level;
+    g_log_max_bytes = (unsigned long long)max_size_mb * 1024ULL * 1024ULL;
+    g_log_retention_days = retention_days;
+
+    if (g_log_min_level == HUA_LOG_OFF) {
+        if (g_log_fp) {
+            fclose(g_log_fp);
+            g_log_fp = NULL;
+        }
+    } else {
+        if (!g_log_fp)
+            open_log_locked();
+        if (g_log_fp && g_log_bytes >= g_log_max_bytes) {
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            rotate_log_locked(&st);
+        }
+        cleanup_old_logs_locked();
+    }
+    LeaveCriticalSection(&g_log_cs);
+}
+
 void hua_log_init(void)
 {
     if (g_log_ready)
@@ -36,35 +197,24 @@ void hua_log_init(void)
 
     InitializeCriticalSection(&g_log_cs);
 
-    /* 路径优先级：exe 同级目录（便携）优先；不可写则退回 %APPDATA%\hua\。 */
-    wchar_t dir[MAX_PATH];
-    wchar_t path[MAX_PATH];
-
-    /* 二进制追加：直接写 UTF-8 字节（源码/字面量已是 UTF-8），不走 CRT 的
-     * Unicode 翻译层——ccs=UTF-8 会把流设成宽字符模式，narrow fprintf 会失效。
-     * 失败也不致命，后续 hua_logf 会静默跳过。 */
-    /* _snwprintf 截断时返回 -1 且不写终止符，必须手动补（与 hua_appdata_dir 一致）。 */
-    if (hua_exe_dir(dir, MAX_PATH)) {
-        _snwprintf(path, MAX_PATH, L"%shua.log", dir);
-        path[MAX_PATH - 1] = L'\0';
-        g_log_fp = _wfopen(path, L"ab");
-    }
-    if (!g_log_fp && hua_appdata_dir(dir, MAX_PATH)) {
-        _snwprintf(path, MAX_PATH, L"%shua.log", dir);
-        path[MAX_PATH - 1] = L'\0';
-        g_log_fp = _wfopen(path, L"ab");
-    }
-    if (g_log_fp) {
-        fseek(g_log_fp, 0, SEEK_END);
-        if (ftell(g_log_fp) == 0) {
-            /* 新文件：写 UTF-8 BOM，方便 Notepad 正确识别中文。 */
-            static const unsigned char bom[3] = {0xEF, 0xBB, 0xBF};
-            fwrite(bom, 1, sizeof(bom), g_log_fp);
-        }
-    }
     g_log_ready = true;
+    if (g_log_min_level != HUA_LOG_OFF) {
+        EnterCriticalSection(&g_log_cs);
+        if (open_log_locked()) {
+            if (g_log_bytes >= g_log_max_bytes) {
+                SYSTEMTIME st;
+                GetLocalTime(&st);
+                rotate_log_locked(&st);
+            }
+            cleanup_old_logs_locked();
+        }
+        LeaveCriticalSection(&g_log_cs);
+    }
 
-    HUA_LOG_I("==== hua 启动 ====");
+    /* 版本号必须打在启动行：它是用户判断「跑的是不是刚构建的 exe」的唯一凭据。
+     * 构建时 exe 若被运行中的实例锁住，链接会失败（LNK1104）而产物停在旧版本，
+     * 没有这个标记的话，接下来测出的所有行为都会被归咎于新改的代码。 */
+    HUA_LOG_I("==== hua %s 启动 ====", HUA_VERSION_STR);
 }
 
 void hua_log_close(void)
@@ -84,7 +234,7 @@ void hua_log_close(void)
 
 void hua_logf(HuaLogLevel level, const char *fmt, ...)
 {
-    if (!g_log_ready || !g_log_fp)
+    if (!g_log_ready)
         return;
 
     SYSTEMTIME st;
@@ -96,12 +246,23 @@ void hua_logf(HuaLogLevel level, const char *fmt, ...)
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
 
+    char line[1280];
+    int line_len = snprintf(line, sizeof(line), "%02d:%02d:%02d.%03d [%s] %s\r\n",
+                            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                            level_str(level), msg);
+    if (line_len <= 0)
+        return;
+    size_t write_len = (size_t)line_len < sizeof(line) ? (size_t)line_len : sizeof(line) - 1;
+
     EnterCriticalSection(&g_log_cs);
-    if (g_log_fp) {
-        fprintf(g_log_fp, "%02d:%02d:%02d.%03d [%s] %s\r\n",
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-                level_str(level), msg);
-        fflush(g_log_fp);
+    if (g_log_fp && level >= g_log_min_level && g_log_min_level != HUA_LOG_OFF) {
+        if (g_log_bytes + write_len > g_log_max_bytes && g_log_bytes > 3)
+            rotate_log_locked(&st);
+        if (g_log_fp) {
+            size_t written = fwrite(line, 1, write_len, g_log_fp);
+            g_log_bytes += written;
+            fflush(g_log_fp);
+        }
     }
     LeaveCriticalSection(&g_log_cs);
 }
@@ -191,13 +352,24 @@ bool hua_appdata_dir(wchar_t *out, size_t cap)
     base[MAX_PATH - 1] = L'\0';
     CoTaskMemFree(known);
 
-    /* 先确保 %APPDATA%\hua 存在（不含末尾反斜杠给 CreateDirectory）。 */
+    /* 先确保 %APPDATA%\hua 存在（不含末尾反斜杠给 CreateDirectory）。
+     *
+     * 两处拼接都必须判截断，不能只补终止符了事：klen 最大可到 259，加上 "\hua\"
+     * 就会溢出 MAX_PATH。此前的写法补完 NUL 就 return true，等于把一个**被截断的
+     * 路径当成功交出去**——klen=258 时 out 成了 AppData 根目录，配置被写到
+     * %APPDATA%\hua.ini；klen=255 时尾反斜杠被截掉，调用方会拼出 %APPDATA%\huahua.ini
+     * 这种垃圾文件名。同文件的 hua_exe_dir 与 main.c 的 .tmp 拼接都严格判了返回值，
+     * 这里理应一致。 */
     wchar_t dir[MAX_PATH];
-    _snwprintf(dir, MAX_PATH, L"%s\\hua", base);
+    int dn = _snwprintf(dir, MAX_PATH, L"%s\\hua", base);
+    if (dn < 0 || dn >= MAX_PATH)
+        return false;
     dir[MAX_PATH - 1] = L'\0';
     CreateDirectoryW(dir, NULL);   /* 已存在也无妨 */
 
-    _snwprintf(out, cap, L"%s\\hua\\", base);
+    int on = _snwprintf(out, cap, L"%s\\hua\\", base);
+    if (on < 0 || (size_t)on >= cap)
+        return false;   /* 截断即失败：调用方有兜底（日志放弃 / 配置落内置默认） */
     out[cap - 1] = L'\0';
     return true;
 }

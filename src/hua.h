@@ -22,6 +22,7 @@
 #define WM_HUA_TRAY    (WM_APP + 1)   /* 托盘图标回调消息 */
 #define WM_HUA_HOOK    (WM_APP + 2)   /* 钩子线程上报事件；wParam=事件类型（见下） */
 #define WM_HUA_RELOAD  (WM_APP + 3)   /* 文件监听线程：ini 变化，请重载 */
+#define WM_HUA_UPDATE  (WM_APP + 4)   /* 更新检查线程：发现新版，请在主线程弹气泡 */
 
 /* WM_HUA_HOOK 的 wParam 取值 */
 enum {

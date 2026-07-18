@@ -52,21 +52,26 @@ bool ctx_is_fullscreen(HWND hwnd)
     }
 
     /*
-     * 普通最大化窗口的 GetWindowRect 会因不可见 resize border 超出显示器
-     * 数个像素，不能据此判成全屏。Chrome/Edge 等自绘标题栏仍保留
-     * WS_CAPTION；真正的无边框全屏通常会移除该样式。
+     * 系统通知状态：只有目标本来就是前台窗口时，才用这个全局状态辅助判断。
+     * 多显示器上可能是一块屏幕的游戏让系统进入 D3D 全屏，而用户正要在另一块
+     * 屏幕的普通窗口上起手；把全局状态无条件套给目标会误伤后者。
      */
-    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-    if (IsZoomed(hwnd) && (style & WS_CAPTION))
-        return false;
-
-    /* 系统通知状态：全屏 D3D / 演示模式 → 视为全屏。 */
     QUERY_USER_NOTIFICATION_STATE state;
-    if (SUCCEEDED(SHQueryUserNotificationState(&state))) {
+    if (hwnd == GetForegroundWindow() &&
+        SUCCEEDED(SHQueryUserNotificationState(&state))) {
         if (state == QUNS_RUNNING_D3D_FULL_SCREEN ||
             state == QUNS_PRESENTATION_MODE)
             return true;
     }
+
+    /*
+     * IsZoomed 是 Windows 对“普通最大化”的直接状态，比标题栏样式可靠。
+     * 钉钉等自绘标题栏窗口没有 WS_CAPTION；副屏隐藏任务栏后，其最大化矩形又恰好
+     * 等于整块显示器，旧逻辑便把它误判成全屏。真正的无边框全屏通常是直接铺设
+     * WS_POPUP 窗口而非 SW_MAXIMIZE；D3D/演示全屏已在上面优先识别。
+     */
+    if (IsZoomed(hwnd))
+        return false;
 
     /* 几何比对：窗口矩形是否覆盖整块显示器。 */
     RECT wr;

@@ -1,0 +1,58 @@
+name: CI
+
+# 每次推送 main / PR：三架构（x64 / x86 / ARM64）都编译 + 跑单元测试
+# + 校验「零运行时依赖」与 PE 架构。目的是让问题在合并前暴露，而非等到打标签发版才发现。
+on:
+  push:
+    branches: ["main", "master"]
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
+  pull_request:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: windows-latest   # 自带 CMake 与 Visual Studio (MSVC)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            cmake_arch: x64
+          - arch: x86
+            cmake_arch: Win32
+          - arch: arm64
+            cmake_arch: ARM64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (MSVC ${{ matrix.arch }})
+        run: cmake -S . -B build -A ${{ matrix.cmake_arch }}
+
+      - name: Build (Release)
+        run: cmake --build build --config Release
+
+      - name: Test (ctest)
+        # ARM64 产物无法在 x64 runner 上执行，只做编译校验
+        if: matrix.arch != 'arm64'
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Verify runtime deps + PE arch
+        shell: pwsh
+        run: |
+          $exe = "build/Release/hua.exe"
+          # 1) 零运行时依赖（静态 CRT）：产物不得依赖 VC++ 运行库，否则干净系统起不来
+          $dumpbin = (Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio" -Recurse -Filter dumpbin.exe -EA SilentlyContinue |
+                      Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1).FullName
+          $bad = & $dumpbin /dependents $exe | Select-String -Pattern 'VCRUNTIME|api-ms-win-crt'
+          if ($bad) { $bad; throw "产物仍依赖 VC++ 运行库，违反零依赖约定" }
+          # 2) 架构正确：校验 PE Machine 字段与本矩阵分支一致，防止发错架构
+          $b = [IO.File]::ReadAllBytes($exe)
+          $m = [BitConverter]::ToUInt16($b, [BitConverter]::ToInt32($b, 0x3C) + 4)
+          $want = switch ("${{ matrix.arch }}") { "x64" { 0x8664 } "x86" { 0x14C } "arm64" { 0xAA64 } }
+          if ($m -ne $want) { throw "架构不符：期望 0x$($want.ToString('X4'))，实际 0x$($m.ToString('X4'))" }
+          Write-Host "零依赖 + 架构 0x$($m.ToString('X4')) OK"

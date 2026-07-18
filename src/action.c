@@ -210,28 +210,53 @@ static bool tap(WORD vk)
 
 /* ---------------- 内置命令表 ---------------- */
 
+/*
+ * 窗口类命令的目标复核。
+ *
+ * target 是手势**按下时**锁定的窗口，执行要到 END（200ms+ 之后）才发生，其间窗口
+ * 可能已自行关闭。Windows 会回收并复用 HWND，故不复核就可能把 WM_CLOSE 发给一个
+ * 毫不相干的新窗口。send_key 路径的 activate_target 早就在做这件事了（IsWindow），
+ * cmd: 路径此前没有。
+ */
+static bool target_is_live(HWND target)
+{
+    return target != NULL && IsWindow(target);
+}
+
 static bool exec_cmd(const char *name, HWND target)
 {
+    /*
+     * 返回值必须如实反映成败。此前这几条一律 `return target != NULL` —— 「成功」
+     * 只等于「指针非空」，而默认 11 条手势里有 5 条走这里。main.c 特意把日志放在
+     * 执行**之后**并带上结果，为的就是不让日志断言一件没发生的事；恒真的返回值
+     * 把那套设计整个架空了。
+     * 注意 ShowWindow 的返回值是「调用前是否可见」，不是成败，故改用状态复核。
+     */
     if (strcmp(name, "close_window") == 0) {
-        if (target) PostMessageW(target, WM_CLOSE, 0, 0);
-        return target != NULL;
+        if (!target_is_live(target)) return false;
+        return PostMessageW(target, WM_CLOSE, 0, 0) != 0;
     }
     if (strcmp(name, "minimize") == 0) {
-        if (target) ShowWindow(target, SW_MINIMIZE);
-        return target != NULL;
+        if (!target_is_live(target)) return false;
+        ShowWindow(target, SW_MINIMIZE);
+        return IsIconic(target) != 0;
     }
     if (strcmp(name, "maximize") == 0) {
-        if (target) ShowWindow(target, SW_MAXIMIZE);
-        return target != NULL;
+        if (!target_is_live(target)) return false;
+        ShowWindow(target, SW_MAXIMIZE);
+        return IsZoomed(target) != 0;
     }
     if (strcmp(name, "restore") == 0) {
-        if (target) ShowWindow(target, SW_RESTORE);
-        return target != NULL;
+        if (!target_is_live(target)) return false;
+        ShowWindow(target, SW_RESTORE);
+        /* 还原成功 = 既不最小化也不最大化。 */
+        return !IsIconic(target) && !IsZoomed(target);
     }
     if (strcmp(name, "toggle_maximize") == 0) {
-        if (target)
-            ShowWindow(target, IsZoomed(target) ? SW_RESTORE : SW_MAXIMIZE);
-        return target != NULL;
+        if (!target_is_live(target)) return false;
+        bool was_zoomed = IsZoomed(target) != 0;
+        ShowWindow(target, was_zoomed ? SW_RESTORE : SW_MAXIMIZE);
+        return (IsZoomed(target) != 0) != was_zoomed;   /* 状态确实翻转了才算成功 */
     }
     if (strcmp(name, "scroll_top") == 0) {
         KeyCombo k = {0}; k.ctrl = true; k.vk = VK_HOME;
