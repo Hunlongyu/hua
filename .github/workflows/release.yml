@@ -124,8 +124,11 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           base="${tag#v}"; base="${base%%-*}"
-          BASE="https://github.com/${REPO}/releases/download/${tag}"
-          # 从 CHANGELOG.md 抽出本版章节，作为 Release 正文——updater 手动更新弹窗会展示它。
+          # 从 CHANGELOG.md 抽出本版章节作为 Release 正文。这段正文同时是 updater 更新弹窗的
+          # 内容，而弹窗是纯文本 MessageBox，故这里只放「变更内容」本身：
+          #  - 不再手写下载表格——GitHub 的 Assets 区已自动列出全部资产，表格在纯文本弹窗里只会
+          #    糊成一堆 markdown 符号；
+          #  - 把 markdown 装饰（行首 #、**、`）抹平，让弹窗与 Release 页面都干净可读。
           # 用字面量 index() 匹配节头，不用动态正则：gawk 会把动态正则里的 \[ 当成字符类
           # 元字符而非字面 [，导致节头匹配不上、正文静默丢失（已实测）。
           section=$(awk -v hdr="## [$base]" '
@@ -133,27 +136,13 @@ jobs:
             f && /^## \[/ {exit}
             f {print}
           ' CHANGELOG.md)
-          {
-            echo '## 下载'
-            echo
-            echo '| 架构 | 单文件 exe | 压缩包 | 适用系统 |'
-            echo '|:---:|:---|:---|:---|'
-            echo "| **x64** | [hua-x64.exe](${BASE}/hua-x64.exe) | [zip](${BASE}/hua-${tag}-win-x64.zip) | 64 位 Windows 10/11（推荐） |"
-            echo "| **x86** | [hua-x86.exe](${BASE}/hua-x86.exe) | [zip](${BASE}/hua-${tag}-win-x86.zip) | 32 位 Windows |"
-            echo "| **ARM64** | [hua-arm64.exe](${BASE}/hua-arm64.exe) | [zip](${BASE}/hua-${tag}-win-arm64.zip) | ARM 设备（Surface Pro X 等），原生运行 |"
-            echo
-            echo '推荐下载 **zip**：解压即得 `hua.exe`（无版本/架构后缀），自动更新后文件名保持不变，'
-            echo '快速启动工具（claunch 等）绑定不失效。单文件 exe 下载即用（需管理员权限），'
-            echo '可自行重命名为 `hua.exe`。zip 内另含默认 `hua.ini` 与许可证。'
-            echo
-            echo '## 更新内容'
-            echo
-            if [ -n "$section" ]; then
-              echo "$section"
-            else
-              echo "详见 [CHANGELOG.md](https://github.com/${REPO}/blob/main/CHANGELOG.md)。"
-            fi
-          } > NOTES.md
+          if [ -n "$section" ]; then
+            # 抹平 markdown 装饰后，再用 `/./,$!d` 删掉开头的空行（节头后紧跟的空行）。
+            printf '%s\n' "$section" | sed -E 's/^#{1,6}[[:space:]]*//; s/\*\*//g; s/`//g' \
+              | sed '/./,$!d' > NOTES.md
+          else
+            echo "详见 CHANGELOG.md：https://github.com/${REPO}/blob/main/CHANGELOG.md" > NOTES.md
+          fi
           cat NOTES.md
 
       - name: Publish to GitHub Release
