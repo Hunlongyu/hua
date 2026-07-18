@@ -15,7 +15,7 @@
 - `.ini` 配置 **UTF-8 + 热加载**（改文件即生效）。
 - 默认**管理员权限**运行（手势可作用于提权窗口）；**开机自启**走任务计划程序（静默提权）。
 - 仅托盘图标，无配置窗口。
-- **内置自动更新**：托盘「检查更新」一键升级（GitHub Release 单文件模式，SHA-256 校验 + 原子替换重启）。
+- **内置自动更新**：启动后台静默检查，发现新版仅弹托盘气泡；托盘「检查更新」一键升级（GitHub Release 单文件模式，SHA-256 校验 + 原子替换重启）。
 
 ## 下载
 
@@ -43,7 +43,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 产物：`hua.exe`（MSVC 在 `build/Release/`，MinGW 在 `build/`）。运行需管理员权限；发布时把 `hua.exe` 与 `config/hua.ini` 放同一目录。
 
-第三方仅以源码内联编译：`third_party/ini.c`（inih，配置解析）、`third_party/utest.h`（单元测试）。无运行时 DLL 依赖（除系统自带的 GDI+）。
+**单文件、零第三方运行时依赖**：CRT 静态链接（无需 VC++ 运行库），所有第三方组件均以源码内联编译，仅依赖系统自带 DLL（GDI+、WinHTTP、bcrypt 等）。详见下方[许可证](#许可证)。
 
 ## 使用
 
@@ -123,11 +123,14 @@ Enabled = false           ; 该程序禁用手势
 
 本项目以 [MIT License](LICENSE) 发布。
 
-第三方组件（源码内联编译，无运行时 DLL 依赖）：
+第三方组件均以源码内联编译，无运行时 DLL 依赖：
 
 | 组件 | 用途 | 许可证 |
 |---|---|---|
 | [inih](https://github.com/benhoyt/inih) | `.ini` 配置解析 | BSD-3-Clause，见 [third_party/inih-LICENSE.txt](third_party/inih-LICENSE.txt) |
+| [winautoupdate](https://github.com/Hunlongyu/updater) | 自动更新（GitHub Release 检查 / 下载 / 替换） | MIT，见 [third_party/updater/LICENSE](third_party/updater/LICENSE) |
+| [cJSON](https://github.com/DaveGamble/cJSON) | 解析 GitHub API 响应（updater 依赖） | MIT，见 [cJSON-LICENSE.txt](third_party/updater/src/third_party/cJSON-LICENSE.txt) |
+| [semver.c](https://github.com/h2non/semver.c) | 版本号比较（updater 依赖） | MIT，见 [semver-LICENSE.txt](third_party/updater/src/third_party/semver-LICENSE.txt) |
 | [utest.h](https://github.com/sheredom/utest.h) | 单元测试框架（仅测试，不进产物） | Unlicense |
 
 ## 设计文档
