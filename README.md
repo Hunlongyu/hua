@@ -29,6 +29,8 @@
 | **x86** | 32 位 Windows |
 | **ARM64** | ARM 设备（Surface Pro X 等），原生运行 |
 
+**推荐经 zip 安装**：解压即得 `hua.exe`（文件名不含版本号与架构后缀）。自动更新采用**就地替换**——只替换正在运行的那个文件、不改文件名，所以升级后它始终叫 `hua.exe`，claunch 等快速启动工具绑定不会失效。单文件 exe 资产按架构命名（`hua-x64.exe` 等，仅用于区分下载与匹配架构），下载后可自行重命名为 `hua.exe`。
+
 更新历史见 [CHANGELOG.md](CHANGELOG.md)。发布由推送 `v*` 标签的 GitHub Actions 自动完成（标签版本须与 [`src/version.h`](src/version.h) 一致）。
 
 ## 构建

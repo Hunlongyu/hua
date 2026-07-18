@@ -11,8 +11,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 当前构建的架构串。发布产物按架构命名（hua-v1.0.9-x64.exe / -x86.exe / -arm64.exe），
- * 每个架构的 exe 只应更新到同架构资产——否则会给 ARM 设备装上 x64 包。 */
+/* 当前构建的架构串。自更新资产按架构命名、不带版本号（hua-x64.exe / hua-x86.exe /
+ * hua-arm64.exe）：更新库就地替换运行中的 exe、保持其磁盘文件名不变（用户通常安装为
+ * hua.exe），故资产名里没必要、也不应带版本号——带了只会让直接运行资产的人看到「文件名
+ * 停在旧版本」。架构必须保留：一个 Release 内三架构资产名须唯一，且要防止给 ARM 设备
+ * 装上 x64 包。 */
 #if defined(_M_ARM64) || defined(__aarch64__)
 #  define HUA_ARCH "arm64"
 #elif defined(_M_X64) || defined(__x86_64__)
@@ -23,10 +26,13 @@
 #  error "未知架构：无法确定自动更新的资产名"
 #endif
 
-/* hua 的仓库与资产约定。EXE 单文件模式：便携程序，原子 rename 替换最干净。 */
+/* hua 的仓库与资产约定。EXE 单文件模式：便携程序，原子 rename 替换最干净。
+ * pattern 无通配符 → au_glob_match 退化为整串精确匹配（该匹配器是全串锚定的），
+ * 恰好命中唯一的 hua-<arch>.exe（zip 结尾非 .exe，过渡期的 hua-v*-<arch>.exe 因多一段
+ * 版本串也不等值），满足 au_pick_asset「唯一匹配」要求。 */
 #define UPD_OWNER          "Hunlongyu"
 #define UPD_REPO           "hua"
-#define UPD_ASSET_PATTERN  "hua-*-" HUA_ARCH ".exe"
+#define UPD_ASSET_PATTERN  "hua-" HUA_ARCH ".exe"
 
 /* UTF-8 → 新分配宽字符串（调用方 free）。updater 的对外 API 用 UTF-8，此处转宽显示。 */
 static wchar_t *u8_to_w(const char *s) {
