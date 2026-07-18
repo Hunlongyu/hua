@@ -36,10 +36,15 @@ static int read_ratelimit(HINTERNET hReq) {
     return -1;
 }
 
-/* 核心请求。sink_mem 非 NULL 时写内存；否则 hSink 为文件句柄流式落盘。 */
+/* 核心请求。
+ *  - out_mem 非 NULL：响应体写入新分配的内存缓冲。
+ *  - 否则 hSink 为文件句柄，流式落盘。
+ *  - out_location 非 NULL：**不跟随重定向**，遇 3xx 时把 Location 头（UTF-8）写入
+ *    *out_location 并即刻返回 AU_OK（不读响应体）。用于读取 github.com 网页端点
+ *    releases/latest 的 302 目标以取回最新 tag（限流兜底路径）。 */
 static au_err_t do_request(au_ctx_t* ctx, const wchar_t* url, int is_api,
                            char** out_mem, size_t* out_len,
-                           HANDLE hSink, au_http_meta* meta) {
+                           HANDLE hSink, char** out_location, au_http_meta* meta) {
     au_err_t rc = AU_ERR_NET;
     HINTERNET hSession = NULL, hConnect = NULL, hRequest = NULL;
     wchar_t host[256] = {0}, path[4096] = {0};
@@ -75,8 +80,10 @@ static au_err_t do_request(au_ctx_t* ctx, const wchar_t* url, int is_api,
                                   https ? WINHTTP_FLAG_SECURE : 0);
     if (!hRequest) goto done;
 
-    /* 跟随重定向（默认行为，显式设置以防万一）；跨主机自动丢弃 Authorization。 */
-    DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+    /* 常规请求跟随重定向（跨主机自动丢弃 Authorization）；读取 Location 模式下则
+     * 禁止跟随，自己拿 302 的目标。 */
+    DWORD redirect = out_location ? WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+                                  : WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
     WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof redirect);
 
     headers = build_headers(ctx, is_api);
@@ -93,6 +100,25 @@ static au_err_t do_request(au_ctx_t* ctx, const wchar_t* url, int is_api,
     if (meta) { meta->status = (int)status; meta->ratelimit_remaining = ratelimit; }
 
     if (status == 403 && ratelimit == 0) { rc = AU_ERR_RATELIMIT; goto done; }
+
+    /* 读取 Location 模式：只要 302 的目标，不读体。 */
+    if (out_location) {
+        if (status >= 300 && status < 400) {
+            wchar_t loc[2048]; DWORD ll = sizeof loc;
+            if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_LOCATION,
+                                    WINHTTP_HEADER_NAME_BY_INDEX, loc, &ll,
+                                    WINHTTP_NO_HEADER_INDEX)) {
+                *out_location = au_wide_to_utf8(loc);
+                rc = *out_location ? AU_OK : AU_ERR_NOMEM;
+            } else {
+                rc = AU_ERR_HTTP;   /* 3xx 却无 Location 头 */
+            }
+        } else {
+            rc = AU_ERR_HTTP;       /* 期望重定向却非 3xx（如仓库无 release 时 404） */
+        }
+        goto done;
+    }
+
     if (status < 200 || status >= 300)  { rc = AU_ERR_HTTP; goto done; }
 
     /* 总长度（下载进度用；可能缺失）。 */
@@ -163,13 +189,28 @@ done:
 au_err_t au_http_get_mem(au_ctx_t* ctx, const wchar_t* url,
                          char** out, size_t* len, au_http_meta* meta) {
     if (!ctx || !url || !out || !len) return AU_ERR_ARG;
-    return do_request(ctx, url, 1, out, len, NULL, meta);
+    return do_request(ctx, url, 1, out, len, NULL, NULL, meta);
+}
+
+/* 网页端点取内存（非 API：不发 Accept/X-GitHub-Api-Version）。用于抓 checksums.txt。 */
+au_err_t au_http_get_mem_web(au_ctx_t* ctx, const wchar_t* url,
+                             char** out, size_t* len, au_http_meta* meta) {
+    if (!ctx || !url || !out || !len) return AU_ERR_ARG;
+    return do_request(ctx, url, 0, out, len, NULL, NULL, meta);
 }
 
 au_err_t au_http_get_file(au_ctx_t* ctx, const wchar_t* url, HANDLE hFile,
                           au_http_meta* meta) {
     if (!ctx || !url || hFile == INVALID_HANDLE_VALUE) return AU_ERR_ARG;
-    return do_request(ctx, url, 0, NULL, NULL, hFile, meta);
+    return do_request(ctx, url, 0, NULL, NULL, hFile, NULL, meta);
+}
+
+/* GET url 但不跟随重定向，取回 3xx 的 Location 头（UTF-8，新分配，调用方 free）。 */
+au_err_t au_http_get_location(au_ctx_t* ctx, const wchar_t* url,
+                              char** out_location, au_http_meta* meta) {
+    if (!ctx || !url || !out_location) return AU_ERR_ARG;
+    *out_location = NULL;
+    return do_request(ctx, url, 0, NULL, NULL, NULL, out_location, meta);
 }
 
 /* {url} 模板替换。 */

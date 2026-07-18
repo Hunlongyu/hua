@@ -117,6 +117,20 @@ jobs:
         with:
           path: artifacts   # 各架构落到 artifacts/hua-<arch>/
 
+      - name: Generate checksums.txt
+        shell: bash
+        # 自动更新的「限流兜底」路径走 github.com 网页端点，拿不到 REST API 的 digest 字段，
+        # 改从本文件取 SHA-256 校验下载的资产（updater 按 basename 查表，见 au_web.c）。
+        # 没有它，兜底路径只能跳过校验并告警——自替换的 exe 不该在无校验下落盘。
+        run: |
+          : > checksums.txt
+          find artifacts -type f \( -name '*.exe' -o -name '*.zip' \) -print0 \
+            | sort -z \
+            | while IFS= read -r -d '' f; do
+                printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")" >> checksums.txt
+              done
+          cat checksums.txt
+
       - name: Build release notes
         shell: bash
         env:
@@ -154,6 +168,6 @@ jobs:
           case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease";; esac
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
             --title "hua $GITHUB_REF_NAME" --notes-file NOTES.md $prerelease \
-            artifacts/*/* \
+            artifacts/*/* checksums.txt \
           || { gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file NOTES.md; \
-               gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" artifacts/*/* --clobber; }
+               gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" artifacts/*/* checksums.txt --clobber; }

@@ -71,6 +71,16 @@ typedef struct {
 au_err_t au_http_get_mem(au_ctx_t* ctx, const wchar_t* url,
                          char** out, size_t* len, au_http_meta* meta);
 
+/* 同 au_http_get_mem，但不发 API 专属头（Accept/X-GitHub-Api-Version）。
+ * 用于抓取 github.com 网页端点的小文件（如 checksums.txt）。 */
+au_err_t au_http_get_mem_web(au_ctx_t* ctx, const wchar_t* url,
+                             char** out, size_t* len, au_http_meta* meta);
+
+/* GET url 但**不跟随重定向**，取回 3xx 的 Location 头（UTF-8，新分配，调用方 free）。
+ * 非 3xx（如无 release 时的 404）返回 AU_ERR_HTTP。 */
+au_err_t au_http_get_location(au_ctx_t* ctx, const wchar_t* url,
+                              char** out_location, au_http_meta* meta);
+
 /* GET url 流式写入 fp（已打开的二进制写文件）。触发进度回调与取消检查。 */
 au_err_t au_http_get_file(au_ctx_t* ctx, const wchar_t* url, HANDLE hFile,
                           au_http_meta* meta);
@@ -102,6 +112,22 @@ int      au_file_exists(const wchar_t* path);
  * 与网络无关，供单测直接喂 fixture。成功时 *out 由调用方 au_release_free 释放。 */
 au_err_t au_select_best_from_json(au_ctx_t* ctx, const char* json, size_t len,
                                   au_release_t** out);
+
+/* ---------------- au_web.c：API 限流兜底（网页端点，无 REST API）---------------- */
+
+/* 从 GitHub 重定向 Location（形如 ".../releases/tag/<TAG>"）中截出 <TAG>。
+ * 遇 '/'、'?'、'#' 或结尾停止。成功写入 out（含 '\0'）并返回 1；无 "/releases/tag/"、
+ * 空 tag 或超出 cap 返回 0。纯函数，供单测。 */
+int au_web_tag_from_location(const char* location, char* out, size_t cap);
+
+/* 在 checksums.txt 文本里查 filename 的 SHA-256（接受 "<hex>  name" 与 sha256sum 的
+ * "<hex> *name" 两种格式，按 basename 大小写不敏感匹配）。命中且为 64 位十六进制时
+ * 写入小写 out_hex[65] 并返回 1；否则返回 0。纯函数，供单测。 */
+int au_web_checksum_for(const char* checksums, const char* filename, char out_hex[65]);
+
+/* 限流兜底：走 github.com 网页端点取最新 release（仅 stable 通道 + 无通配符的
+ * asset_pattern）。成功时 *out 由调用方 au_release_free 释放。 */
+au_err_t au_fetch_web_fallback(au_ctx_t* ctx, au_release_t** out);
 
 /* ---------------- 日志辅助 ---------------- */
 void au_logf(au_ctx_t* ctx, au_log_level_t lv, const char* fmt, ...);

@@ -154,7 +154,15 @@ au_err_t au_fetch_latest(au_ctx_t* ctx, au_release_t** out) {
 
     char* json = NULL; size_t jlen = 0;
     au_err_t rc = fetch_api_json(ctx, &json, &jlen);
-    if (rc != AU_OK) return rc;
+
+    /* 正规 REST API 优先；仅在被限流时退到 github.com 网页端点兜底（见 au_web.c）。
+     * 其它错误（网络/HTTP/解析）如实上报，不被兜底掩盖。 */
+    if (rc == AU_ERR_RATELIMIT) {
+        au_logf(ctx, AU_LOG_WARN, "REST API rate limited; falling back to web endpoint");
+        free(json);
+        return au_fetch_web_fallback(ctx, out);
+    }
+    if (rc != AU_OK) { free(json); return rc; }
 
     rc = au_select_best_from_json(ctx, json, jlen, out);
     free(json);
