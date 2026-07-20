@@ -119,7 +119,9 @@ static DWORD WINAPI update_thread(LPVOID param) {
 
     int cmp = au_compare_current(ctx, rel);
     if (cmp <= 0) {
-        HUA_LOG_I("[update] 已是最新（当前 %s，最新 %hs）", HUA_VERSION, rel->ver.raw);
+        /* 用窄串 HUA_VERSION_STR：HUA_LOG_* 是窄(UTF-8)日志，传宽串 HUA_VERSION 是 UB——
+         * L"1.0.13" 的字节是 '1',0,'.',0,...，窄 %s 读到第一个 NUL 就停，只打出 "1"。 */
+        HUA_LOG_I("[update] 已是最新（当前 %s，最新 %hs）", HUA_VERSION_STR, rel->ver.raw);
         if (job->manual) {
             wchar_t msg[128];
             _snwprintf(msg, 128, L"已是最新版本 v%s。", HUA_VERSION);

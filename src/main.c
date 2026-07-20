@@ -27,6 +27,14 @@
 
 #define TIMER_FRAME    1   /* 手势进行中的重绘节流计时器 */
 #define TIMER_WATCHDOG 2   /* 钩子探活计时器 */
+#define TIMER_TRAY_RETRY 3 /* 托盘图标补加计时器（见 tray_add 失败处） */
+
+/* 开机自启时资源管理器可能还没建好托盘区，NIM_ADD 会失败。理论上等它广播
+ * TaskbarCreated 即可重建，但那条广播并不保证送达（见 WinMain 里的 UIPI 说明），
+ * 而托盘是本程序唯一的 UI 入口，丢了就再也没法重载配置或退出。故失败后自行重试兜底。
+ * 2s × 90 ≈ 3 分钟，足够覆盖慢盘/杀软扫描下的开机；超时仍失败则记 ERROR 收手。 */
+#define TRAY_RETRY_INTERVAL_MS    2000
+#define TRAY_RETRY_MAX_ATTEMPTS   90
 
 #define WATCHDOG_INTERVAL_MS      3000    /* 探活周期 */
 #define WATCHDOG_LOG_THROTTLE_MS  60000   /* 重装日志限频（见 TIMER_WATCHDOG 分支） */
@@ -49,8 +57,9 @@ static HINSTANCE g_hinst;
 static HWND      g_hwnd;
 static NOTIFYICONDATAW g_nid;
 static bool      g_icon_owned;   /* g_nid.hIcon 是否由我们拥有（需 DestroyIcon） */
-/* 资源管理器重启后会向所有顶层窗口广播此消息，届时托盘图标需要重建，
- * 否则图标永久消失——而托盘是本程序唯一的 UI 入口（主窗口是 HWND_MESSAGE）。 */
+/* 资源管理器重建托盘区（重启，或开机时晚于我们启动）后会向所有【顶层】窗口广播此消息，
+ * 届时托盘图标需要重建，否则图标永久消失——而托盘是本程序唯一的 UI 入口。
+ * 主窗口因此刻意建成顶层窗口而非 HWND_MESSAGE（后者收不到广播），见 WinMain 处注释。 */
 static UINT      g_wm_taskbar_created;
 
 /* ini 文件监听（热加载） */
@@ -554,7 +563,8 @@ static void tray_free_icon(void)
     g_icon_owned = false;
 }
 
-static void tray_add(HWND hwnd)
+/* 返回是否成功注册托盘图标；调用方据此决定要不要挂补加计时器。 */
+static bool tray_add(HWND hwnd)
 {
     /* 本函数可能被 TaskbarCreated 重复调用。旧图标句柄要留到新注册建立之后再释放：
      * 若此刻就销毁，而下面的 NIM_ADD 又失败（例如广播是多余的、图标其实还在），
@@ -589,13 +599,15 @@ static void tray_add(HWND hwnd)
     /* 托盘是本程序唯一的 UI 入口，加不上图标 = 用户无法重载配置也无法退出。
      * 最常见的失败（开机自启早于资源管理器建好托盘区）由 TaskbarCreated 兜底重建，
      * 这里至少要留下日志，否则完全不可诊断。 */
-    if (!Shell_NotifyIconW(NIM_ADD, &g_nid))
-        HUA_LOG_W("添加托盘图标失败: %lu（若资源管理器尚未就绪，将在其广播后重建）",
+    bool ok = Shell_NotifyIconW(NIM_ADD, &g_nid) ? true : false;
+    if (!ok)
+        HUA_LOG_W("添加托盘图标失败: %lu（资源管理器尚未就绪；将定时重试并等待其广播）",
                   GetLastError());
 
     /* 新注册已建立（或已彻底失败），此时释放旧句柄才安全。 */
     if (old_icon && old_owned)
         DestroyIcon(old_icon);
+    return ok;
 }
 
 static void tray_remove(void)
@@ -637,8 +649,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
      * 资源管理器重启会重建托盘区，此时必须重新 NIM_ADD，否则图标永久消失、
      * 用户再也无法重载配置或退出（本程序无其他 UI）。 */
     if (g_wm_taskbar_created && msg == g_wm_taskbar_created) {
-        tray_add(hwnd);
-        HUA_LOG_I("资源管理器重启，已重建托盘图标");
+        if (tray_add(hwnd)) {
+            /* 广播来了且加成了，就不必再让补加计时器空转。 */
+            KillTimer(hwnd, TIMER_TRAY_RETRY);
+            HUA_LOG_I("收到 TaskbarCreated，已重建托盘图标");
+        }
         return 0;
     }
 
@@ -765,6 +780,21 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
 
     case WM_TIMER:
+        if (wParam == TIMER_TRAY_RETRY) {
+            /* 开机时资源管理器还没建好托盘区。这里定时补加，不依赖 TaskbarCreated 送达。 */
+            static int attempts;
+            if (tray_add(hwnd)) {
+                KillTimer(hwnd, TIMER_TRAY_RETRY);
+                HUA_LOG_I("托盘图标已补加成功（第 %d 次重试）", attempts + 1);
+                attempts = 0;
+            } else if (++attempts >= TRAY_RETRY_MAX_ATTEMPTS) {
+                KillTimer(hwnd, TIMER_TRAY_RETRY);
+                HUA_LOG_E("托盘图标补加失败：重试 %d 次仍未成功，放弃（手势仍可用，"
+                          "但无法从托盘重载配置或退出）", attempts);
+                attempts = 0;
+            }
+            return 0;
+        }
         if (wParam == TIMER_WATCHDOG) {
             /* 钩子被系统静默摘掉后 g_hook 仍非空，hook_install 会误判「已装好」，
              * 手势将永久失效且用户无从察觉。故探活到异常就强制重装。
@@ -1021,11 +1051,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     /* 必须在 tray_add 之前注册：资源管理器重启后靠它重建图标。 */
     g_wm_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
-    if (!g_wm_taskbar_created)
+    if (!g_wm_taskbar_created) {
         HUA_LOG_W("注册 TaskbarCreated 失败: %lu（资源管理器重启后托盘图标不会恢复）",
                   GetLastError());
+    } else {
+        /*
+         * 放行 UIPI，否则这条广播根本送不到本进程。
+         *
+         * 本程序以管理员权限运行（清单 requireAdministrator + 任务计划 HighestAvailable），
+         * 完整性级别高于广播方 explorer.exe；而 UIPI 只允许消息从【同级或更高】流向更低，
+         * 低→高一律丢弃且不报错。实测过一台机器：hua 为 System(12288)、explorer 为
+         * High(8192)，开机时 NIM_ADD 失败后再也收不到 TaskbarCreated，托盘图标整个会话都
+         * 不出现（进程却活着，手势正常）——正是这条过滤把兜底路径本身给挡了。
+         * ChangeWindowMessageFilterEx 把该消息按窗口加白名单，是微软给提权程序的标准解法。
+         */
+        if (!ChangeWindowMessageFilterEx(g_hwnd, g_wm_taskbar_created, MSGFLT_ALLOW, NULL))
+            HUA_LOG_W("放行 TaskbarCreated 失败: %lu（提权运行时可能收不到该广播）",
+                      GetLastError());
+    }
 
-    tray_add(g_hwnd);
+    /* 加不上就挂计时器补加：不能只依赖广播（见上）。 */
+    if (!tray_add(g_hwnd)) {
+        if (!SetTimer(g_hwnd, TIMER_TRAY_RETRY, TRAY_RETRY_INTERVAL_MS, NULL))
+            HUA_LOG_E("托盘补加计时器创建失败: %lu（托盘图标可能整个会话都不出现）",
+                      GetLastError());
+    }
 
     if (!overlay_init(hInstance))
         HUA_LOG_W("overlay 初始化失败（浮层不可用，不影响手势）");

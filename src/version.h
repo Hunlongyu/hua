@@ -8,7 +8,7 @@
  * 锁住、链接失败却被误判为构建成功，用户拿旧二进制测了一整轮的事。 */
 #define HUA_VER_MAJOR 1
 #define HUA_VER_MINOR 0
-#define HUA_VER_PATCH 12
+#define HUA_VER_PATCH 13
 
 #define HUA_STRINGIZE_(x) #x
 #define HUA_STRINGIZE(x)  HUA_STRINGIZE_(x)
