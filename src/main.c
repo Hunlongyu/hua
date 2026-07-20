@@ -534,19 +534,22 @@ static void ini_write_autostart(bool enable)
 /* 启动时把自启任务与配置对账。 */
 static void autostart_reconcile(void)
 {
-    bool exists = autostart_exists();
-    /* 失败必须留痕：此前两个分支都只有 if 没有 else，对账失败是彻底静默的——
+    /*
+     * 开启时**无条件重建**（RegisterTask 是 CREATE_OR_UPDATE，幂等）。
+     * 不能只在「任务不存在」时才建：1.0.12 及更早版本建出来的任务带着一批错误的默认设置
+     * （72 小时后被杀、电池下不启动、拔电源即停），而那些任务是"存在"的，只按存在与否
+     * 对账的话，老用户永远迁移不过来。顺带也能自愈——任务被别的工具改坏了下次启动就修回。
+     * 代价是每次启动多一次本地 RPC；这段本就排在装钩子之前，见 WinMain 处的顺序说明。
+     *
+     * 失败必须留痕：此前两个分支都只有 if 没有 else，对账失败是彻底静默的——
      * 用户看到的是「开机自启就是不工作」，日志里一个字都没有。
-     * （具体原因由 autostart.c 的 run_hidden 记录，这里只说结论。） */
-    if (g_config.auto_start && !exists) {
-        if (autostart_set(true))
-            HUA_LOG_I("已创建开机自启任务");
-        else
+     * 成功日志由 autostart_set 自己打（它才知道具体建成了什么设置），这里只补失败后果。
+     */
+    if (g_config.auto_start) {
+        if (!autostart_set(true))
             HUA_LOG_W("创建开机自启任务失败，开机不会自动启动（原因见上一条）");
-    } else if (!g_config.auto_start && exists) {
-        if (autostart_set(false))
-            HUA_LOG_I("已移除开机自启任务");
-        else
+    } else if (autostart_exists()) {
+        if (!autostart_set(false))
             HUA_LOG_W("移除开机自启任务失败，开机仍会自动启动（原因见上一条）");
     }
 }
@@ -1020,15 +1023,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     load_config();
 
     /*
-     * 顺序要紧：autostart_reconcile 会同步等 schtasks（最多 5s，且不泵消息）。
-     * 必须把它排在**创建窗口与装钩子之前**，有两个独立的理由：
+     * 顺序要紧：autostart_reconcile 会同步调任务计划的 COM 接口（每次启动至少一次
+     * autostart_exists），期间不泵消息。改用 COM 后不再 spawn schtasks，耗时已大幅下降，
+     * 但仍是一次跨进程 RPC——开机时 Task Scheduler 服务可能正在启动，反而更慢。
+     * 故必须把它排在**创建窗口与装钩子之前**，有两个独立的理由：
      *   1) LL 钩子回调必须靠本线程检索消息才能派发，超过 LowLevelHooksTimeout
-     *      （默认 300ms）系统就静默摘钩且不通知。开机自启场景下 schtasks 冷启动
-     *      常达数百毫秒，钩子会在消息循环启动前就被摘掉，表现为托盘正常、日志
-     *      「就绪」、但手势整个会话无响应。
-     *   2) 我们的窗口是顶层窗口（见下），一旦创建就是广播目标。此时若卡在
-     *      schtasks 上不泵消息，别的进程 SendMessageTimeout(HWND_BROADCAST, ...)
-     *      （如安装器改 PATH 后广播 WM_SETTINGCHANGE）会被我们拖到超时。
+     *      （默认 300ms）系统就静默摘钩且不通知。若这段 RPC 卡在装钩子之后，钩子会在
+     *      消息循环启动前就被摘掉，表现为托盘正常、日志「就绪」、但手势整个会话无响应。
+     *   2) 我们的窗口是顶层窗口（见下），一旦创建就是广播目标。此时若卡在 RPC 上不泵
+     *      消息，别的进程 SendMessageTimeout(HWND_BROADCAST, ...)（如安装器改 PATH 后
+     *      广播 WM_SETTINGCHANGE）会被我们拖到超时。
      */
     autostart_reconcile();
 

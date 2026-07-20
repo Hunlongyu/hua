@@ -119,7 +119,9 @@ target_link_libraries(hua PRIVATE hua_core hua_updater gdiplus)
 # gcc 驱动对 exe 无条件链入自带的 default-manifest.o，与我们 RC 里的 manifest
 # 冲突。我们的 manifest 排在链接行更前故胜出（已验证 exe 内只含 requireAdministrator）。
 # 该警告无害，且项目 CI 用 MSVC（经 mt.exe 处理 manifest），不会出现此警告。
-target_link_libraries(hua PRIVATE user32 shell32 gdi32 hua_warnings)
+# taskschd/ole32/oleaut32：autostart.c 用任务计划 COM API 建自启任务（命令行 schtasks
+# 设不了"不限运行时长/电池下也启动"，而落临时 XML 文件会引入提权面，见 autostart.c 开头）。
+target_link_libraries(hua PRIVATE user32 shell32 gdi32 taskschd ole32 oleaut32 hua_warnings)
 
 if(MSVC)
   # hua.rc 已内嵌 requireAdministrator 清单，禁止链接器再生成同 ID 清单。
