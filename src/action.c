@@ -6,6 +6,7 @@
 
 #include <assert.h>
 #include <string.h>
+#include <wchar.h>   /* wcscmp：MSVC 经 string.h 也能拿到，MinGW 下未必 */
 #include <ctype.h>
 #include <stdlib.h>
 
@@ -223,6 +224,56 @@ static bool target_is_live(HWND target)
     return target != NULL && IsWindow(target);
 }
 
+/*
+ * 最近一次被 hua 最小化的窗口。用途：窗口最小化后桌面就空了，此时在桌面上画
+ * 「恢复/最大化」本来是空操作（目标是桌面窗口，ShowWindow 对它没有意义），
+ * 改义为把这个窗口拿回来。只记最后一个，不做栈。
+ */
+static HWND g_last_minimized;
+
+/*
+ * 目标是不是桌面本身。桌面图标区（SHELLDLL_DefView / SysListView32）经
+ * GA_ROOTOWNER 解析后会落到 Progman 或 WorkerW —— 启用壁纸幻灯片等情况下是后者，
+ * 两个都要认，只认 Progman 会在部分机器上失效。
+ */
+static bool is_desktop_window(HWND w)
+{
+    if (!w)
+        return false;
+    if (w == GetShellWindow())
+        return true;
+    wchar_t cls[32];
+    if (!GetClassNameW(w, cls, (int)(sizeof(cls) / sizeof(cls[0]))))
+        return false;
+    return wcscmp(cls, L"Progman") == 0 || wcscmp(cls, L"WorkerW") == 0;
+}
+
+/*
+ * 把最近一次被 hua 最小化的窗口恢复回来。成功返回 true；无记录或记录已失效返回
+ * false，调用方按「手势无动作」处理（浮层照常提示，不会静默）。
+ */
+static bool restore_last_minimized(void)
+{
+    HWND w = g_last_minimized;
+    if (!w)
+        return false;
+
+    /* 无论成败都先清空：既避免反复触发，也避免 HWND 被系统回收复用后，
+     * 我们拿着一个陈旧句柄去操作一个毫不相干的新窗口。 */
+    g_last_minimized = NULL;
+
+    if (!IsWindow(w))
+        return false;   /* 窗口已关闭 */
+    if (!IsIconic(w))
+        return false;   /* 用户已自行还原过，记录过期 */
+
+    ShowWindow(w, SW_RESTORE);
+    /* 尽力前置。前台锁定策略下可能被系统拒绝，但 SW_RESTORE 本身通常已带激活，
+     * 且「窗口回来了」才是主要目的，故不拿它的返回值判成败。 */
+    SetForegroundWindow(w);
+    return !IsIconic(w);
+}
+
 static bool exec_cmd(const char *name, HWND target)
 {
     /*
@@ -239,20 +290,33 @@ static bool exec_cmd(const char *name, HWND target)
     if (strcmp(name, "minimize") == 0) {
         if (!target_is_live(target)) return false;
         ShowWindow(target, SW_MINIMIZE);
-        return IsIconic(target) != 0;
+        bool ok = IsIconic(target) != 0;
+        /* 记住它：窗口收起来后桌面就空了，随后在桌面上画「恢复」即可拿回来。 */
+        if (ok)
+            g_last_minimized = target;
+        return ok;
     }
+    /*
+     * 下面三条「放大/还原」类命令在**桌面**上都改义为「恢复最近一次被 hua 最小化的
+     * 窗口」：目标是桌面窗口时它们本就是空操作，而窗口刚收起、桌面空着的时候，用户
+     * 画这几个手势想要的正是把它拿回来。判断必须排在 target_is_live 之前——桌面窗口
+     * 本身是"活"的，先过那道检查就会走进对桌面 ShowWindow 的无效分支。
+     */
     if (strcmp(name, "maximize") == 0) {
+        if (is_desktop_window(target)) return restore_last_minimized();
         if (!target_is_live(target)) return false;
         ShowWindow(target, SW_MAXIMIZE);
         return IsZoomed(target) != 0;
     }
     if (strcmp(name, "restore") == 0) {
+        if (is_desktop_window(target)) return restore_last_minimized();
         if (!target_is_live(target)) return false;
         ShowWindow(target, SW_RESTORE);
         /* 还原成功 = 既不最小化也不最大化。 */
         return !IsIconic(target) && !IsZoomed(target);
     }
     if (strcmp(name, "toggle_maximize") == 0) {
+        if (is_desktop_window(target)) return restore_last_minimized();
         if (!target_is_live(target)) return false;
         bool was_zoomed = IsZoomed(target) != 0;
         ShowWindow(target, was_zoomed ? SW_RESTORE : SW_MAXIMIZE);
