@@ -43,6 +43,23 @@ static bool write_utf8(const wchar_t *path, const char *text)
     return CloseHandle(file) && written_ok;
 }
 
+static bool read_utf8(const wchar_t *path, char *text, size_t cap)
+{
+    if (cap < 2)
+        return false;
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+    DWORD read = 0;
+    BOOL read_ok = ReadFile(file, text, (DWORD)(cap - 1), &read, NULL);
+    BOOL close_ok = CloseHandle(file);
+    if (!read_ok || !close_ok)
+        return false;
+    text[read] = '\0';
+    return true;
+}
+
 static bool remove_test_dir(const wchar_t *directory)
 {
     wchar_t marker[MAX_PATH], temp[MAX_PATH];
@@ -96,6 +113,29 @@ UTEST(crash_diag, marker_control_characters_do_not_reach_previous_run)
     ASSERT_TRUE(crash_diag_previous_run() == NULL);
     crash_diag_mark_clean_shutdown();
     crash_diag_shutdown();
+    ASSERT_TRUE(remove_test_dir(dir));
+}
+
+UTEST(crash_diag, unreadable_old_marker_aborts_without_replacing_it)
+{
+    static const char old_marker[] =
+        "format=1\r\nversion=1.0.14\r\npid=1234\r\n"
+        "started=2026-07-21T08:30:00.000+08:00\r\n";
+    wchar_t dir[MAX_PATH], marker[MAX_PATH];
+    char actual_marker[sizeof(old_marker)];
+    ASSERT_TRUE(make_test_dir(dir, MAX_PATH, L"sharing"));
+    join_path(marker, MAX_PATH, dir, L"hua-running.state");
+    ASSERT_TRUE(write_utf8(marker, old_marker));
+
+    /* Deny marker reads but permit deletion, so an implementation that mistakes
+     * the sharing violation for absence can still replace this marker. */
+    HANDLE lock = CreateFileW(marker, GENERIC_READ, FILE_SHARE_DELETE, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    ASSERT_NE(lock, INVALID_HANDLE_VALUE);
+    ASSERT_FALSE(crash_diag_init_in_directory_for_test(dir));
+    ASSERT_TRUE(CloseHandle(lock));
+    ASSERT_TRUE(read_utf8(marker, actual_marker, sizeof(actual_marker)));
+    ASSERT_STREQ(old_marker, actual_marker);
     ASSERT_TRUE(remove_test_dir(dir));
 }
 

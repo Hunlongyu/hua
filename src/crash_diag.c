@@ -14,6 +14,12 @@ static char g_previous_run[256];
 static bool g_initialized;
 static bool g_clean;
 
+typedef enum {
+    OLD_MARKER_ABSENT,
+    OLD_MARKER_PRESENT,
+    OLD_MARKER_ERROR
+} OldMarkerReadResult;
+
 static bool make_directory(const wchar_t *directory)
 {
     if (CreateDirectoryW(directory, NULL))
@@ -46,25 +52,25 @@ static void reset_state(void)
     g_clean = false;
 }
 
-static bool read_old_marker(char *text, size_t cap, size_t *length)
+static OldMarkerReadResult read_old_marker(char *text, size_t cap, size_t *length)
 {
     HANDLE file = CreateFileW(g_marker_path, GENERIC_READ, FILE_SHARE_READ,
                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file == INVALID_HANDLE_VALUE) {
         if (GetLastError() == ERROR_FILE_NOT_FOUND)
-            return false;
-        return false;
+            return OLD_MARKER_ABSENT;
+        return OLD_MARKER_ERROR;
     }
 
     DWORD read = 0;
     BOOL read_ok = ReadFile(file, text, (DWORD)(cap - 1), &read, NULL);
     BOOL close_ok = CloseHandle(file);
     if (!read_ok || !close_ok)
-        return false;
+        return OLD_MARKER_ERROR;
 
     text[read] = '\0';
     *length = read;
-    return true;
+    return OLD_MARKER_PRESENT;
 }
 
 static bool copy_marker_value(const char *line, const char *key,
@@ -239,7 +245,13 @@ static bool init_in_directory(const wchar_t *directory)
 
     char old_marker[512];
     size_t old_length = 0;
-    if (read_old_marker(old_marker, sizeof(old_marker), &old_length))
+    OldMarkerReadResult old_marker_result =
+        read_old_marker(old_marker, sizeof(old_marker), &old_length);
+    if (old_marker_result == OLD_MARKER_ERROR) {
+        reset_state();
+        return false;
+    }
+    if (old_marker_result == OLD_MARKER_PRESENT)
         parse_previous_marker(old_marker, old_length);
 
     if (!write_marker()) {
