@@ -173,3 +173,12 @@ set_target_properties(test_logging PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/log-test"
 )
 add_test(NAME logging COMMAND test_logging)
+
+add_executable(test_crash_diag tests/test_crash_diag.c src/crash_diag.c)
+target_compile_definitions(test_crash_diag PRIVATE HUA_CRASH_DIAG_TESTING)
+target_include_directories(test_crash_diag PRIVATE src third_party)
+target_link_libraries(test_crash_diag PRIVATE dbghelp shell32 hua_warnings)
+set_target_properties(test_crash_diag PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/crash-test"
+)
+add_test(NAME crash_diag COMMAND test_crash_diag)
