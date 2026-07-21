@@ -194,6 +194,18 @@ static bool activate_target(HWND target)
     return activated || GetForegroundWindow() == target;
 }
 
+/*
+ * ShellExecuteW 会把已存在的资源管理器窗口复用掉，但前台锁定策略可能阻止它激活，
+ * 结果仅任务栏闪烁。执行前把本次前台权限交给 Shell 处理的进程。
+ */
+static bool shell_open_foreground(const wchar_t *path)
+{
+    AllowSetForegroundWindow(ASFW_ANY);
+    HINSTANCE result = ShellExecuteW(GetForegroundWindow(), L"open", path,
+                                    NULL, NULL, SW_SHOWNORMAL);
+    return (INT_PTR)result > 32;   /* ShellExecute 约定：>32 为成功 */
+}
+
 static bool send_key_to_target(const KeyCombo *k, HWND target)
 {
     if (!activate_target(target))
@@ -363,8 +375,7 @@ static bool exec_cmd(const char *name, HWND target)
         if (!slash)
             return false;
         *slash = L'\0';   /* 截断文件名，保留目录 */
-        HINSTANCE r = ShellExecuteW(NULL, L"open", path, NULL, NULL, SW_SHOWNORMAL);
-        return (INT_PTR)r > 32;
+        return shell_open_foreground(path);
     }
     return false;   /* 未知命令 */
 }
