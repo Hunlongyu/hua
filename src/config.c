@@ -111,7 +111,8 @@ void config_set_defaults(Config *c)
     c->trigger_distance      = 5;
     c->min_distance          = 20;
     c->step_distance         = 12;
-    c->tolerance             = 0;              /* 精确匹配（我们的默认） */
+    c->match_score           = CFG_DEFAULT_MATCH_SCORE;
+    c->ambiguity_margin      = CFG_DEFAULT_AMBIGUITY_MARGIN;
     c->pause_timeout         = 1000;
     c->filter_mode           = CFG_FILTER_BLACKLIST;
     c->disable_on_fullscreen = true;
@@ -144,15 +145,39 @@ void config_set_defaults(Config *c)
 
 /* ---------------- 建模：各节 ---------------- */
 
-/* 返回 false = 已达容量上限、本条被丢弃（调用方需计入诊断）。 */
-static bool add_global_gesture(Config *c, const char *key, const char *val)
+static bool normalize_gesture_key(Config *c, const char *key,
+                                  char normalized[CFG_MAX_KEY])
 {
+    if (rec_normalize_template(key, normalized, CFG_MAX_KEY) != 0)
+        return true;
+    c->diag.invalid_gestures++;
+    record_issue(c, key);
+    return false;
+}
+
+static void add_global_gesture(Config *c, const char *key, const char *val)
+{
+    char normalized[CFG_MAX_KEY];
+    if (!normalize_gesture_key(c, key, normalized))
+        return;
+
+    for (size_t i = 0; i < c->gesture_count; i++) {
+        if (strcmp(c->gestures[i].key, normalized) == 0) {
+            copy_str(c->gestures[i].action, CFG_MAX_ACTION, val);
+            c->diag.duplicate_gestures++;
+            record_issue(c, key);
+            return; /* 与常见 ini 语义一致：同一标准模板后定义覆盖前定义 */
+        }
+    }
     if (c->gesture_count >= CFG_MAX_GESTURES)
-        return false;
+    {
+        c->diag.dropped++;
+        record_issue(c, key);
+        return;
+    }
     Gesture *g = &c->gestures[c->gesture_count++];
-    copy_str(g->key, CFG_MAX_KEY, key);
+    copy_str(g->key, CFG_MAX_KEY, normalized);
     copy_str(g->action, CFG_MAX_ACTION, val);
-    return true;
 }
 
 /* 找到或新建 app（按小写 exe 名）。满则返回 NULL。 */
@@ -175,15 +200,29 @@ static AppConfig *find_or_create_app(Config *c, const char *exe)
     return a;
 }
 
-/* 返回 false = 该 app 的手势已达上限、本条被丢弃（调用方需计入诊断）。 */
-static bool add_app_gesture(AppConfig *a, const char *key, const char *val)
+static void add_app_gesture(Config *c, AppConfig *a, const char *key, const char *val)
 {
+    char normalized[CFG_MAX_KEY];
+    if (!normalize_gesture_key(c, key, normalized))
+        return;
+
+    for (size_t i = 0; i < a->gesture_count; i++) {
+        if (strcmp(a->gestures[i].key, normalized) == 0) {
+            copy_str(a->gestures[i].action, CFG_MAX_ACTION, val);
+            c->diag.duplicate_gestures++;
+            record_issue(c, key);
+            return;
+        }
+    }
     if (a->gesture_count >= CFG_MAX_APP_GESTURES)
-        return false;
+    {
+        c->diag.dropped++;
+        record_issue(c, key);
+        return;
+    }
     Gesture *g = &a->gestures[a->gesture_count++];
-    copy_str(g->key, CFG_MAX_KEY, key);
+    copy_str(g->key, CFG_MAX_KEY, normalized);
     copy_str(g->action, CFG_MAX_ACTION, val);
-    return true;
 }
 
 /* ---------------- inih 回调 ---------------- */
@@ -198,7 +237,8 @@ static int handler(void *user, const char *section, const char *name,
         else if (cieq(name, "TriggerDistance"))     c->trigger_distance = atoi(value);
         else if (cieq(name, "MinDistance"))         c->min_distance = atoi(value);
         else if (cieq(name, "StepDistance"))        c->step_distance = atoi(value);
-        else if (cieq(name, "Tolerance"))           c->tolerance = atoi(value);
+        else if (cieq(name, "MatchScore"))          c->match_score = atoi(value);
+        else if (cieq(name, "AmbiguityMargin"))     c->ambiguity_margin = atoi(value);
         else if (cieq(name, "PauseTimeout"))        c->pause_timeout = atoi(value);
         else if (cieq(name, "FilterMode"))          c->filter_mode = parse_filter(value);
         /* 第 4 个实参是该字段的文档默认值，须与 config_set_defaults 保持一致。 */
@@ -241,10 +281,7 @@ static int handler(void *user, const char *section, const char *name,
     }
 
     if (cieq(section, "Gestures")) {
-        if (!add_global_gesture(c, name, value)) {
-            c->diag.dropped++;
-            record_issue(c, name);
-        }
+        add_global_gesture(c, name, value);
         return 1;
     }
 
@@ -260,10 +297,8 @@ static int handler(void *user, const char *section, const char *name,
             record_issue(c, section);
         } else if (cieq(name, "Enabled")) {
             a->enabled = parse_bool(c, name, value, true);
-        } else if (!add_app_gesture(a, name, value)) {
-            c->diag.dropped++;
-            record_issue(c, name);
-        }
+        } else
+            add_app_gesture(c, a, name, value);
         return 1;
     }
 
@@ -303,9 +338,13 @@ static void config_clamp(Config *c)
     c->log_max_size_mb  = fallback_clamp(c->log_max_size_mb,  10, 1, 1024);
     c->log_retention_days = fallback_clamp(c->log_retention_days, 2, 1, 3650);
 
-    /* 0 是合法语义的字段：tolerance=0 精确匹配、trail_max_length=0 不限、
-     * text_outline_width=0 不描边、pause_timeout=0 不超时。故只夹不回落。 */
-    c->tolerance           = clamp_int(c->tolerance,           0, CFG_MAX_TOLERANCE);
+    /* MatchScore 必须为正；AmbiguityMargin=0 则明确关闭歧义拒识。 */
+    c->match_score        = fallback_clamp(c->match_score,
+                                            CFG_DEFAULT_MATCH_SCORE, 1, 100);
+    c->ambiguity_margin   = clamp_int(c->ambiguity_margin, 0, 30);
+
+    /* 0 是合法语义的字段：trail_max_length=0 不限、text_outline_width=0 不描边、
+     * pause_timeout=0 不超时。故只夹不回落。 */
     c->pause_timeout       = clamp_int(c->pause_timeout,       0, 600000);
     c->trail_max_length    = clamp_int(c->trail_max_length,    0, 1000000);
     c->text_outline_width  = clamp_int(c->text_outline_width,  0, 100);
@@ -334,6 +373,8 @@ bool config_parse_string(Config *c, const char *text)
 
 const char *config_lookup_global(const Config *c, const char *seq)
 {
+    if (!c || !seq)
+        return NULL;
     for (size_t i = 0; i < c->gesture_count; i++)
         if (strcmp(c->gestures[i].key, seq) == 0)
             return c->gestures[i].action;
@@ -342,6 +383,8 @@ const char *config_lookup_global(const Config *c, const char *seq)
 
 const AppConfig *config_find_app(const Config *c, const char *exe_lower)
 {
+    if (!c || !exe_lower)
+        return NULL;
     for (size_t i = 0; i < c->app_count; i++)
         if (strcmp(c->apps[i].name, exe_lower) == 0)
             return &c->apps[i];
@@ -350,6 +393,8 @@ const AppConfig *config_find_app(const Config *c, const char *exe_lower)
 
 const char *config_lookup_app(const AppConfig *app, const char *seq)
 {
+    if (!app || !seq)
+        return NULL;
     for (size_t i = 0; i < app->gesture_count; i++)
         if (strcmp(app->gestures[i].key, seq) == 0)
             return app->gestures[i].action;
@@ -368,19 +413,6 @@ bool config_app_enabled(const Config *c, const char *exe_lower, bool is_fullscre
     return true;
 }
 
-/* 在一组 Gesture 上用 rec_match（按 tolerance）匹配，命中返回 action。 */
-static const char *match_gestures(const Gesture *g, size_t n, const char *seq,
-                                  int tolerance)
-{
-    const char *keys[CFG_MAX_GESTURES];
-    if (n > CFG_MAX_GESTURES)
-        n = CFG_MAX_GESTURES;
-    for (size_t i = 0; i < n; i++)
-        keys[i] = g[i].key;
-    int idx = rec_match(seq, keys, n, tolerance);
-    return idx >= 0 ? g[idx].action : NULL;
-}
-
 /* cmd:none = 显式「无动作」。主要用于 per-app 屏蔽某个全局手势
  * （如 39=key:f5 在 PPT 里会触发放映，可用 [App:powerpnt.exe] 39=cmd:none 挡掉）。
  * 归一到「未匹配」语义：调用方拿到 NULL，浮层照常提示「手势无动作」。 */
@@ -391,15 +423,75 @@ static bool is_none_action(const char *a)
 
 const char *config_resolve(const Config *c, const char *exe_lower, const char *seq)
 {
+    if (!c || !seq || !seq[0])
+        return NULL;
     const AppConfig *app = exe_lower ? config_find_app(c, exe_lower) : NULL;
     if (app) {
-        const char *a = match_gestures(app->gestures, app->gesture_count,
-                                       seq, c->tolerance);
+        const char *a = config_lookup_app(app, seq);
         /* 程序覆盖优先；命中 cmd:none 必须就地返回 NULL，绝不能回落到全局映射，
          * 否则屏蔽不生效。 */
         if (a)
             return is_none_action(a) ? NULL : a;
     }
-    const char *g = match_gestures(c->gestures, c->gesture_count, seq, c->tolerance);
+    const char *g = config_lookup_global(c, seq);
     return is_none_action(g) ? NULL : g;
+}
+
+static bool gesture_key_seen(const Gesture *const *items, size_t count, const char *key)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(items[i]->key, key) == 0)
+            return true;
+    }
+    return false;
+}
+
+const char *config_resolve_path(const Config *c, const char *exe_lower,
+                                const Pt *pts, size_t n,
+                                char *out_key, size_t out_key_cap,
+                                RecMatchResult *result)
+{
+    RecMatchResult local = {-1, 0, 0};
+    if (!result)
+        result = &local;
+    *result = local;
+    if (out_key && out_key_cap)
+        out_key[0] = '\0';
+    if (!c)
+        return NULL;
+
+    /* 建立“当前程序真正可见”的手势表：app 同 key 覆盖全局，而非先让 app 中任意
+     * 模糊候选抢占。这样所有有效手势在同一个评分空间公平竞争。 */
+    const Gesture *items[CFG_MAX_APP_GESTURES + CFG_MAX_GESTURES];
+    const char *keys[CFG_MAX_APP_GESTURES + CFG_MAX_GESTURES];
+    size_t count = 0;
+    const AppConfig *app = exe_lower ? config_find_app(c, exe_lower) : NULL;
+
+    if (app) {
+        for (size_t i = 0; i < app->gesture_count; i++) {
+            if (!gesture_key_seen(items, count, app->gestures[i].key))
+                items[count++] = &app->gestures[i];
+        }
+    }
+    for (size_t i = 0; i < c->gesture_count; i++) {
+        if (!gesture_key_seen(items, count, c->gestures[i].key))
+            items[count++] = &c->gestures[i];
+    }
+    for (size_t i = 0; i < count; i++)
+        keys[i] = items[i]->key;
+
+    int index = rec_match_path(pts, n, c->min_distance, keys, count,
+                               c->match_score, c->ambiguity_margin, result);
+    if (index < 0) {
+        if (out_key && out_key_cap)
+            rec_encode(pts, n, c->min_distance, out_key, out_key_cap);
+        return NULL;
+    }
+
+    const Gesture *matched = items[index];
+    if (out_key && out_key_cap) {
+        strncpy(out_key, matched->key, out_key_cap - 1);
+        out_key[out_key_cap - 1] = '\0';
+    }
+    return is_none_action(matched->action) ? NULL : matched->action;
 }

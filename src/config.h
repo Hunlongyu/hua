@@ -8,6 +8,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include "recognizer.h"
 
 typedef enum {
     CFG_TRIGGER_RIGHT = 0,
@@ -36,10 +37,8 @@ typedef enum {
 
 #define CFG_MAX_KEY          16
 #define CFG_MAX_ACTION       256
-/* Tolerance 上界。实际手势模板都是 1~4 个方向，容错再大只会让任意手势都命中最短
- * 模板。注意：容错本身是用户主动开启的模糊匹配（默认 0 = 精确匹配，刻意如此以消除
- * "2" vs "26" 的前缀歧义），开启后的误命中属已知取舍，此上界只挡荒谬值。 */
-#define CFG_MAX_TOLERANCE    4
+#define CFG_DEFAULT_MATCH_SCORE       82
+#define CFG_DEFAULT_AMBIGUITY_MARGIN   6
 #define CFG_MAX_GESTURES     128
 #define CFG_MAX_APPS         64
 #define CFG_MAX_APP_GESTURES 64
@@ -62,13 +61,15 @@ typedef struct {
  *
  * 本模块不能自己打日志（要保持可脱离系统单测），故把「解析时默默咽下去的问题」
  * 攒在这里交回调用方。理由与 config_parse_string_ex 的 out_bad_line 完全相同：
- * 静默跳过会让用户的手势莫名不生效而无从排查。此前三类问题都绕开了那个通道——
- * 容量溢出、[General] 未知键、无法解析的布尔值。
+ * 静默跳过会让用户的手势莫名不生效而无从排查。容量溢出、[General] 未知键、
+ * 无法解析的值，以及非法/几何重复手势都通过这里回报。
  */
 typedef struct {
     int  dropped;         /* 因容量上限被丢弃的条目数（全局手势 / [App:] 节 / app 内手势） */
     int  unknown_keys;    /* [General] 中无法识别的键数（多为拼写错误） */
     int  bad_values;      /* 值无法解析、已回落到文档默认值的键数 */
+    int  invalid_gestures;/* 含非法方向或标准化后过长、已忽略的手势数 */
+    int  duplicate_gestures;/* 同一节中几何等价、后定义覆盖前定义的手势数 */
     char first_issue[CFG_MAX_KEY * 2];   /* 首个出问题的键名，便于用户定位；无则为空串 */
 } CfgDiag;
 
@@ -78,7 +79,8 @@ typedef struct {
     int           trigger_distance;  /* 按下后移动多远才开始手势（px） */
     int           min_distance;      /* 方向分段阈值（识别灵敏度，px） */
     int           step_distance;     /* 采点最小间隔（去抖，px） */
-    int           tolerance;         /* 方向串匹配最大编辑距离（0=精确） */
+    int           match_score;       /* 几何匹配最低分，0..100 */
+    int           ambiguity_margin;  /* 最佳候选至少领先第二名多少分 */
     int           pause_timeout;     /* 久不动则取消手势（ms） */
     CfgFilterMode filter_mode;
     bool          disable_on_fullscreen;
@@ -153,9 +155,20 @@ const char *config_lookup_app(const AppConfig *app, const char *seq);
 bool config_app_enabled(const Config *c, const char *exe_lower, bool is_fullscreen);
 
 /*
- * 解析手势动作：程序覆盖 > 全局默认，均按 Tolerance 匹配。
- * 命中返回 action 指针，否则 NULL。exe_lower 可为 NULL（只查全局）。
+ * 按已经确定的方向 key 解析动作：程序覆盖 > 全局默认，严格查找。
+ * 主要供配置逻辑/测试使用；真实鼠标轨迹应走 config_resolve_path。
  */
 const char *config_resolve(const Config *c, const char *exe_lower, const char *seq);
+
+/*
+ * 直接用原始轨迹在当前程序的有效手势集合中做几何识别。
+ * app 中同 key 的条目替换全局条目；app 新增手势与全局手势共同竞争，不会因为来自
+ * app 就绕过最佳/次佳拒识。out_key 收到命中的模板；拒识时收到仅供 OSD 的观测方向串。
+ * cmd:none 会正常命中并写 out_key/result，但返回 NULL（显式无动作）。
+ */
+const char *config_resolve_path(const Config *c, const char *exe_lower,
+                                const Pt *pts, size_t n,
+                                char *out_key, size_t out_key_cap,
+                                RecMatchResult *result);
 
 #endif /* HUA_CONFIG_H */

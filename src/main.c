@@ -161,8 +161,7 @@ static void apply_hook_config(void)
     overlay_end();
     hook_uninstall();
     if (!hook_install(g_hwnd, (HuaTrigger)g_config.trigger,
-                      g_config.trigger_distance, g_config.min_distance,
-                      g_config.step_distance)) {
+                      g_config.trigger_distance, g_config.step_distance)) {
         HUA_LOG_E("hook_install 失败: %lu", GetLastError());
     }
 }
@@ -237,8 +236,8 @@ static void configure_log_before_init(void)
 
 /*
  * 把 config 攒下的解析诊断打出来。config 模块零 Win32 依赖、不能自己打日志，
- * 故它只计数，由这里翻译成人话。三类问题此前都是彻底静默的：用户拼错一个键、
- * 写了个 `ShowTrail = 真`、或手势超过 128 条，都只会表现为「这项设置莫名不生效」。
+ * 故它只计数，由这里翻译成人话。用户拼错一个键、写了个 `ShowTrail = 真`、配置非法/
+ * 重复手势，或手势超过 128 条，都不能只表现为「这项设置莫名不生效」。
  */
 static void log_config_diag(const Config *c)
 {
@@ -256,6 +255,12 @@ static void log_config_diag(const Config *c)
                   "程序节 %d 个、每程序手势 %d 条",
                   c->diag.dropped, first,
                   CFG_MAX_GESTURES, CFG_MAX_APPS, CFG_MAX_APP_GESTURES);
+    if (c->diag.invalid_gestures > 0)
+        HUA_LOG_W("配置中有 %d 个非法手势（首个：%s），已忽略；只允许方向数字 1/2/3/4/6/7/8/9",
+                  c->diag.invalid_gestures, first);
+    if (c->diag.duplicate_gestures > 0)
+        HUA_LOG_W("配置中有 %d 个几何重复手势（首个：%s），已标准化并采用同一节中最后的动作",
+                  c->diag.duplicate_gestures, first);
 }
 
 static void load_config(void)
@@ -708,8 +713,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
             const Pt *ended_pts = NULL;
             size_t ended_n = hook_snapshot(&ended_pts);
-            const char *seq = hook_last_seq();
             HWND target = hook_last_target();
+            char seq[REC_MAX_SEQ];
+            RecMatchResult match;
+            const char *action = config_resolve_path(
+                &g_config, g_active_has_exe ? g_active_exe : NULL,
+                ended_pts, ended_n, seq, sizeof(seq), &match);
             /*
              * had_trail 要回答的是「用户到底划出东西了没有」——划出来了就认这是手势
              * （失败也算），没划出来就是一次普通点击，得把原生右键还回去。
@@ -719,11 +728,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
              * 2 个点（StepDistance=12px，手抖一下就够），had_trail 就为真 —— 于是
              * Down 和 Up 双双被吞，用户只是想点个右键，菜单却凭空消失，且「有没有菜单」
              * 取决于抖动幅度够不够采到第 2 个点，完全是随机的。
-             * 真正的判据是「产出了方向段没有」：空串 = 什么都没划出来 = 普通点击。
+             * 真正的判据是几何预处理是否产出了有效线段；最终匹配已经不依赖方向串。
              */
-            bool had_trail = ended_n >= 2 && seq[0] != '\0';
-            const char *action = config_resolve(&g_config,
-                                                g_active_has_exe ? g_active_exe : NULL, seq);
+            bool had_trail = rec_has_gesture(ended_pts, ended_n, g_config.min_distance);
 
             /* 用最终 seq 刷新一帧最终判定（命中动作名 / 「手势无动作」），再淡出。
              * 实时帧已在绘制过程中显示，这里只是收尾对齐末点。 */
@@ -745,14 +752,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                  * 用户报「手势偶尔失灵」时把排查引向完全错误的方向。 */
                 bool ok = action_execute(action_copy, target);
                 if (ok) {
-                    HUA_LOG_I("手势 \"%s\" [%s] → %s", seq,
+                    HUA_LOG_I("手势 \"%s\" score=%d second=%d [%s] → %s", seq,
+                              match.score, match.second_score,
                               g_active_has_exe ? g_active_exe : "?", action_copy);
                 } else {
-                    HUA_LOG_W("手势 \"%s\" [%s] → %s 执行失败", seq,
+                    HUA_LOG_W("手势 \"%s\" score=%d second=%d [%s] → %s 执行失败", seq,
+                              match.score, match.second_score,
                               g_active_has_exe ? g_active_exe : "?", action_copy);
                 }
             } else {
-                HUA_LOG_I("手势 \"%s\" → 未匹配%s", seq,
+                HUA_LOG_I("手势 \"%s\" score=%d second=%d → %s%s", seq,
+                          match.score, match.second_score,
+                          match.index >= 0 ? "已匹配但无动作" : "未匹配",
                           had_trail ? "（已有轨迹，不补发右键）" : "");
                 /*
                  * 划出了轨迹却没匹配上：把原始采样点原样打出来。
@@ -901,15 +912,16 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 return 0;
             }
 
-            /* 手势进行中：取当前轨迹点，实时编码+解析，驱动浮层重绘。 */
+            /* 手势进行中：直接对当前原始轨迹做几何匹配，驱动浮层重绘。 */
             const Pt *pts = NULL;
             size_t n = hook_snapshot(&pts);
             if (n < 2)
                 return 0;
             char seq[REC_MAX_SEQ];
-            rec_encode(pts, n, g_config.min_distance, seq, sizeof(seq));
-            const char *action = config_resolve(&g_config,
-                                                g_active_has_exe ? g_active_exe : NULL, seq);
+            RecMatchResult match;
+            const char *action = config_resolve_path(
+                &g_config, g_active_has_exe ? g_active_exe : NULL,
+                pts, n, seq, sizeof(seq), &match);
             overlay_update(pts, n, seq, action ? action_label(action) : NULL);
         }
         return 0;

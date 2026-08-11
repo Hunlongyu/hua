@@ -3,11 +3,11 @@
  *
  * 生命周期（一次手势）：
  *   触发键 Down → 锁定目标窗口、吞掉 Down、进入 Tentative、起点入缓冲
- *   Move        → 按 StepDistance 去抖采点；累计位移过 MinDistance → Active
- *   触发键 Up   → Active: 编码方向串、PostMessage(GESTURE_END)、吞掉 Up
+ *   Move        → 按 StepDistance 去抖采点；累计位移过 TriggerDistance → Active
+ *   触发键 Up   → Active: PostMessage(GESTURE_END)、吞掉 Up
  *                 Tentative(仅点击): 补发原生按键（下+上）还原、吞掉 Up
  *
- * 关键纪律：回调里只做判定/采点/编码（纯 CPU，微秒级），绝不执行动作
+ * 关键纪律：回调里只做判定与采点（纯 CPU，微秒级），绝不识别或执行动作
  * （SendInput/ShellExecute 可能超过 LL 钩子 300ms 超时被系统摘钩）——
  * 动作在主线程收到 GESTURE_END 后执行。
  */
@@ -33,11 +33,10 @@ typedef enum {
 /*
  * 安装钩子。notify_hwnd 收 WM_HUA_HOOK 上报。
  * trigger_dist：按下后移动多远才进入 Active（开始手势）。
- * min_dist：方向分段阈值（识别灵敏度，传给 recognizer）。
  * step_dist：采点最小间隔（去抖）。成功返回 true。
  */
 bool hook_install(HWND notify_hwnd, HuaTrigger trigger,
-                  int trigger_dist, int min_dist, int step_dist);
+                  int trigger_dist, int step_dist);
 void hook_uninstall(void);
 
 /* 钩子探活（启发式：光标动过但钩子无事件 → 已被系统静默摘掉）。
@@ -48,8 +47,7 @@ bool hook_looks_dead(void);
 /* 状态机是否空闲（无手势进行中）。用于避免在手势中途重装钩子。 */
 bool hook_is_idle(void);
 
-/* 供主线程在收到 GESTURE_END 后读取：最近一次识别的方向串与锁定的目标窗口。 */
-const char *hook_last_seq(void);
+/* 供主线程在收到 GESTURE_END 后读取手势开始时锁定的目标窗口。 */
 HWND        hook_last_target(void);
 
 /* 主线程逐帧轮询真实光标位置，弥补部分环境中 WH_MOUSE_LL 丢失 Move 的情况。 */

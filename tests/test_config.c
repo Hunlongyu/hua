@@ -13,7 +13,8 @@ UTEST(config, defaults)
     ASSERT_EQ(c.trigger, CFG_TRIGGER_RIGHT);
     ASSERT_EQ(c.min_distance, 20);
     ASSERT_EQ(c.step_distance, 12);
-    ASSERT_EQ(c.tolerance, 0);                       /* 我们的默认：精确 */
+    ASSERT_EQ(c.match_score, CFG_DEFAULT_MATCH_SCORE);
+    ASSERT_EQ(c.ambiguity_margin, CFG_DEFAULT_AMBIGUITY_MARGIN);
     ASSERT_EQ(c.filter_mode, CFG_FILTER_BLACKLIST);
     ASSERT_TRUE(c.disable_on_fullscreen);
     ASSERT_EQ((int)c.gesture_count, 0);
@@ -62,10 +63,11 @@ UTEST(config, clamps_out_of_range_values)
 {
     Config c;
     /* ini 是不可信输入：超大值会导致平方后有符号溢出（long 在 Windows 是 32 位），
-     * 且 Tolerance 过大会让任何甩动都匹配上模板并真的执行动作。 */
+     * 而越界识别阈值会让拒识策略失去意义。 */
     config_parse_string(&c,
         "[General]\n"
-        "Tolerance=999\n"
+        "MatchScore=999\n"
+        "AmbiguityMargin=999\n"
         "MinDistance=2000000000\n"
         "StepDistance=2000000000\n"
         "TriggerDistance=2000000000\n"
@@ -75,7 +77,8 @@ UTEST(config, clamps_out_of_range_values)
         "TextLetterSpacing=999999\n"
         "LogMaxSizeMB=999999\n"
         "LogRetentionDays=999999\n");
-    ASSERT_EQ(c.tolerance, CFG_MAX_TOLERANCE);
+    ASSERT_EQ(c.match_score, 100);
+    ASSERT_EQ(c.ambiguity_margin, 30);
     ASSERT_EQ(c.min_distance, 10000);
     ASSERT_EQ(c.step_distance, 10000);
     ASSERT_EQ(c.trigger_distance, 10000);
@@ -97,6 +100,7 @@ UTEST(config, invalid_positive_fields_fall_back_to_defaults)
         "MinDistance=0\n"
         "StepDistance=-5\n"
         "TriggerDistance=-1\n"
+        "MatchScore=0\n"
         "TrailWidth=0\n"
         "TextSize=-100\n"
         "LogMaxSizeMB=0\n"
@@ -104,6 +108,7 @@ UTEST(config, invalid_positive_fields_fall_back_to_defaults)
     ASSERT_EQ(c.min_distance, 20);
     ASSERT_EQ(c.step_distance, 12);
     ASSERT_EQ(c.trigger_distance, 5);
+    ASSERT_EQ(c.match_score, CFG_DEFAULT_MATCH_SCORE);
     ASSERT_EQ(c.trail_width, 3);
     ASSERT_EQ(c.text_size, 26);
     ASSERT_EQ(c.log_max_size_mb, 10);
@@ -136,11 +141,11 @@ UTEST(config, zero_is_meaningful_for_some_fields)
     /* 这些字段的 0 是合法语义，不能被回落掉。 */
     config_parse_string(&c,
         "[General]\n"
-        "Tolerance=0\n"
+        "AmbiguityMargin=0\n"
         "TrailMaxLength=0\n"
         "TextOutlineWidth=0\n"
         "TextLetterSpacing=0\n");
-    ASSERT_EQ(c.tolerance, 0);
+    ASSERT_EQ(c.ambiguity_margin, 0);
     ASSERT_EQ(c.trail_max_length, 0);
     ASSERT_EQ(c.text_outline_width, 0);
     ASSERT_EQ(c.text_letter_spacing, 0);
@@ -154,7 +159,8 @@ UTEST(config, parse_general_fields)
         "Trigger = middle\n"
         "MinDistance = 30\n"
         "StepDistance = 8\n"
-        "Tolerance = 1\n"
+        "MatchScore = 78\n"
+        "AmbiguityMargin = 9\n"
         "FilterMode = whitelist\n"
         "DisableOnFullscreen = false\n"
         "LogEnabled = false\n"
@@ -167,7 +173,8 @@ UTEST(config, parse_general_fields)
     ASSERT_EQ(c.trigger, CFG_TRIGGER_MIDDLE);
     ASSERT_EQ(c.min_distance, 30);
     ASSERT_EQ(c.step_distance, 8);
-    ASSERT_EQ(c.tolerance, 1);
+    ASSERT_EQ(c.match_score, 78);
+    ASSERT_EQ(c.ambiguity_margin, 9);
     ASSERT_EQ(c.filter_mode, CFG_FILTER_WHITELIST);
     ASSERT_FALSE(c.disable_on_fullscreen);
     ASSERT_FALSE(c.log_enabled);
@@ -203,6 +210,30 @@ UTEST(config, parse_global_gestures)
     ASSERT_STREQ(config_lookup_global(&c, "6"), "key:alt+right");
     ASSERT_STREQ(config_lookup_global(&c, "26"), "cmd:close_window");
     ASSERT_TRUE(config_lookup_global(&c, "9") == NULL);
+}
+
+UTEST(config, gesture_keys_are_normalized_and_last_duplicate_wins)
+{
+    Config c;
+    ASSERT_TRUE(config_parse_string(&c,
+        "[Gestures]\n6=key:alt+right\n66=key:ctrl+right\n"));
+    ASSERT_EQ((int)c.gesture_count, 1);
+    ASSERT_STREQ(c.gestures[0].key, "6");
+    ASSERT_STREQ(config_lookup_global(&c, "6"), "key:ctrl+right");
+    ASSERT_TRUE(config_lookup_global(&c, "66") == NULL); /* 查找接口仍是严格标准 key */
+    ASSERT_EQ(c.diag.duplicate_gestures, 1);
+    ASSERT_STREQ(c.diag.first_issue, "66");
+}
+
+UTEST(config, invalid_gesture_keys_are_reported_and_dropped)
+{
+    Config c;
+    ASSERT_TRUE(config_parse_string(&c,
+        "[Gestures]\n5=cmd:minimize\nhello=cmd:close_window\n6=key:alt+right\n"));
+    ASSERT_EQ((int)c.gesture_count, 1);
+    ASSERT_STREQ(c.gestures[0].key, "6");
+    ASSERT_EQ(c.diag.invalid_gestures, 2);
+    ASSERT_STREQ(c.diag.first_issue, "5");
 }
 
 UTEST(config, inline_comment_stripped)
@@ -406,21 +437,45 @@ UTEST(resolve, none_is_case_insensitive)
     ASSERT_TRUE(config_resolve(&c, "foo.exe", "39") == NULL);
 }
 
-UTEST(resolve, tolerance_fuzzy)
+UTEST(resolve, direction_lookup_is_strict)
 {
     Config c;
-    config_parse_string(&c, "[General]\nTolerance=1\n[Gestures]\n26=cmd:close_window\n");
-    /* 画成 "266"，编辑距离 1 < 模板长度 2，容错命中 */
-    ASSERT_STREQ(config_resolve(&c, "notepad.exe", "266"), "cmd:close_window");
+    config_parse_string(&c, "[Gestures]\n26=cmd:close_window\n");
+    ASSERT_STREQ(config_resolve(&c, "notepad.exe", "26"), "cmd:close_window");
+    ASSERT_TRUE(config_resolve(&c, "notepad.exe", "266") == NULL);
 }
 
-UTEST(resolve, tolerance_is_clamped_to_sane_upper_bound)
+UTEST(resolve, raw_path_uses_geometry_and_app_override)
 {
     Config c;
-    /* Tolerance 仍是用户主动开启的模糊匹配（默认 0 = 精确），这里只保证
-     * 荒谬的值被夹到有意义的上界，不改变容错本身的语义。 */
-    config_parse_string(&c, "[General]\nTolerance=99\n[Gestures]\n26=cmd:close_window\n");
-    ASSERT_EQ(c.tolerance, CFG_MAX_TOLERANCE);
+    config_parse_string(&c,
+        "[Gestures]\n2=cmd:scroll_bottom\n26=cmd:close_window\n"
+        "[App:chrome.exe]\n26=key:ctrl+w\n");
+    Pt p[] = {{0,0},{0,30},{0,60},{0,100},
+              {30,100},{60,100},{100,100}};
+    char key[REC_MAX_SEQ];
+    RecMatchResult r;
+    ASSERT_STREQ(config_resolve_path(&c, "chrome.exe", p,
+                                     sizeof(p) / sizeof(p[0]), key, sizeof(key), &r),
+                 "key:ctrl+w");
+    ASSERT_STREQ(key, "26");
+    ASSERT_EQ(r.index, 0); /* app 覆盖项排在有效候选表首位 */
+}
+
+UTEST(resolve, raw_path_none_still_reports_a_match)
+{
+    Config c;
+    config_parse_string(&c,
+        "[Gestures]\n39=key:f5\n"
+        "[App:powerpnt.exe]\n39=cmd:none\n");
+    Pt p[] = {{0,0},{20,20},{40,40},{60,60},{80,80},{100,100},
+              {120,80},{140,60},{160,40},{180,20},{200,0}};
+    char key[REC_MAX_SEQ];
+    RecMatchResult r;
+    ASSERT_TRUE(config_resolve_path(&c, "powerpnt.exe", p,
+                                    sizeof(p) / sizeof(p[0]), key, sizeof(key), &r) == NULL);
+    ASSERT_STREQ(key, "39");
+    ASSERT_TRUE(r.index >= 0); /* NULL 是显式无动作，不是识别失败 */
 }
 
 /* ---------------- 布尔值回落（与数值的 fallback_clamp 同一哲学） ---------------- */
@@ -503,19 +558,28 @@ UTEST(config, unknown_key_is_reported)
 UTEST(config, known_keys_are_not_reported_as_unknown)
 {
     Config c;
-    ASSERT_TRUE(config_parse_string(&c, "[General]\nTrailWidth = 5\n"));
+    ASSERT_TRUE(config_parse_string(&c,
+        "[General]\nTrailWidth = 5\nMatchScore = 84\nAmbiguityMargin = 7\n"));
     ASSERT_EQ(c.diag.unknown_keys, 0);
     ASSERT_EQ(c.trail_width, 5);
+    ASSERT_EQ(c.match_score, 84);
+    ASSERT_EQ(c.ambiguity_margin, 7);
 }
 
 /* 容量上限撞满后此前静默丢弃：第 129 条起的手势永不生效且无从排查。 */
 UTEST(config, gesture_overflow_is_reported)
 {
-    static char ini[CFG_MAX_GESTURES * 32 + 256];
+    static char ini[CFG_MAX_GESTURES * 40 + 256];
+    static const char digit[] = {'4', '6', '8', '1'};
     int off = snprintf(ini, sizeof(ini), "[Gestures]\n");
-    for (int i = 0; i < CFG_MAX_GESTURES + 5; i++)
+    for (int i = 0; i < CFG_MAX_GESTURES + 5; i++) {
+        char key[10];
+        snprintf(key, sizeof(key), "2%c2%c2%c2%c",
+                 digit[(i >> 0) & 3], digit[(i >> 2) & 3],
+                 digit[(i >> 4) & 3], digit[(i >> 6) & 3]);
         off += snprintf(ini + off, sizeof(ini) - (size_t)off,
-                        "%d = cmd:minimize\n", 1000 + i);
+                        "%s = cmd:minimize\n", key);
+    }
     static Config c;
     ASSERT_TRUE(config_parse_string(&c, ini));
     ASSERT_EQ((int)c.gesture_count, CFG_MAX_GESTURES);
@@ -548,6 +612,8 @@ UTEST(config, clean_config_reports_nothing)
     ASSERT_EQ(c.diag.dropped, 0);
     ASSERT_EQ(c.diag.unknown_keys, 0);
     ASSERT_EQ(c.diag.bad_values, 0);
+    ASSERT_EQ(c.diag.invalid_gestures, 0);
+    ASSERT_EQ(c.diag.duplicate_gestures, 0);
     ASSERT_STREQ(c.diag.first_issue, "");
 }
 

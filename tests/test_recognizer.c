@@ -67,6 +67,68 @@ static size_t make_v_oriented(Pt *p, size_t cap, double deg, double depth,
     return n;
 }
 
+static double direction_angle(char c)
+{
+    const double PI = 3.14159265358979323846;
+    switch (c) {
+    case '6': return 0.0;
+    case '3': return PI / 4.0;
+    case '2': return PI / 2.0;
+    case '1': return 3.0 * PI / 4.0;
+    case '4': return PI;
+    case '7': return -3.0 * PI / 4.0;
+    case '8': return -PI / 2.0;
+    default:  return -PI / 4.0; /* 9 */
+    }
+}
+
+/* 从方向 key 生成不等长、不等密度且带像素噪声的确定性轨迹。 */
+static size_t make_key_path(Pt *p, size_t cap, const char *key,
+                            int base_length, int max_angle_error_deg,
+                            int noise, unsigned seed)
+{
+    const double PI = 3.14159265358979323846;
+    double start_x = 500.0, start_y = 500.0;
+    size_t n = 0;
+    if (cap)
+        p[n++] = (Pt){(int)start_x, (int)start_y};
+
+    for (size_t segment = 0; key[segment] && n < cap; segment++) {
+        seed = seed * 1103515245u + 12345u;
+        int length_pct = 65 + (int)((seed >> 16) % 91u); /* 65%..155% */
+        double length = (double)base_length * (double)length_pct / 100.0;
+        seed = seed * 1103515245u + 12345u;
+        int error = max_angle_error_deg
+                        ? (int)((seed >> 16) % (unsigned)(2 * max_angle_error_deg + 1))
+                              - max_angle_error_deg
+                        : 0;
+        double angle = direction_angle(key[segment]) + (double)error * PI / 180.0;
+        seed = seed * 1103515245u + 12345u;
+        int steps = 12 + (int)((seed >> 16) % 20u);
+        double end_x = start_x + cos(angle) * length;
+        double end_y = start_y + sin(angle) * length;
+
+        for (int i = 1; i <= steps && n < cap; i++) {
+            double t = (double)i / (double)steps;
+            int jx = 0, jy = 0;
+            if (noise && i != steps) {
+                seed = seed * 1103515245u + 12345u;
+                jx = (int)((seed >> 16) % (unsigned)(2 * noise + 1)) - noise;
+                seed = seed * 1103515245u + 12345u;
+                jy = (int)((seed >> 16) % (unsigned)(2 * noise + 1)) - noise;
+            }
+            double x = start_x + (end_x - start_x) * t;
+            double y = start_y + (end_y - start_y) * t;
+            p[n].x = (int)(x >= 0.0 ? x + 0.5 : x - 0.5) + jx;
+            p[n].y = (int)(y >= 0.0 ? y + 0.5 : y - 0.5) + jy;
+            n++;
+        }
+        start_x = end_x;
+        start_y = end_y;
+    }
+    return n;
+}
+
 /* ---------------- rec_encode：直线各方向 ---------------- */
 
 UTEST(encode, straight_right)
@@ -326,89 +388,209 @@ UTEST(encode, small_jitter_absorbed)
     ASSERT_STREQ(buf, "6");
 }
 
-/* ---------------- rec_levenshtein ---------------- */
+/* ---------------- 模板标准化 ---------------- */
 
-UTEST(levenshtein, equal)
+UTEST(template, normalize_and_validate)
 {
-    ASSERT_EQ(rec_levenshtein("", ""), 0);
-    ASSERT_EQ(rec_levenshtein("abc", "abc"), 0);
+    char key[REC_MAX_SEQ + 1];
+    ASSERT_EQ((int)rec_normalize_template("266699", key, sizeof(key)), 3);
+    ASSERT_STREQ(key, "269");
+    ASSERT_EQ((int)rec_normalize_template("25", key, sizeof(key)), 0);
+    ASSERT_STREQ(key, "");
+    ASSERT_EQ((int)rec_normalize_template("", key, sizeof(key)), 0);
 }
 
-UTEST(levenshtein, empty)
+/* ---------------- 连续几何匹配 ---------------- */
+
+UTEST(match_path, canonical_L_selects_26)
 {
-    ASSERT_EQ(rec_levenshtein("", "abc"), 3);
-    ASSERT_EQ(rec_levenshtein("abc", ""), 3);
+    Pt p[] = {{0,0},{0,25},{0,50},{0,75},{0,100},
+              {25,100},{50,100},{75,100},{100,100}};
+    const char *keys[] = {"2", "26", "6", "3"};
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), 1);
+    ASSERT_EQ(r.index, 1);
+    ASSERT_TRUE(r.score >= 95);
+    ASSERT_TRUE(r.score - r.second_score >= 6);
 }
 
-UTEST(levenshtein, single_edits)
+UTEST(match_path, uneven_sampling_and_scale_do_not_change_result)
 {
-    ASSERT_EQ(rec_levenshtein("26", "2"),   1);   /* 删 */
-    ASSERT_EQ(rec_levenshtein("26", "28"),  1);   /* 改 */
-    ASSERT_EQ(rec_levenshtein("26", "246"), 1);   /* 增 */
+    /* 同一个下右手势：第一段采样密、第二段采样稀，且两臂长度不相等。 */
+    Pt p[] = {{400,300},{401,310},{399,322},{402,335},{400,350},{401,365},
+              {399,382},{400,400},{430,401},{470,399},{520,400},{600,401}};
+    const char *keys[] = {"2", "26", "3", "6"};
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), 1);
+    ASSERT_TRUE(r.score >= 85);
 }
 
-UTEST(levenshtein, classic)
+UTEST(match_path, adaptive_turn_rejects_short_terminal_hook)
 {
-    ASSERT_EQ(rec_levenshtein("kitten", "sitting"), 3);
+    Pt p[] = {{0,0},{0,40},{0,80},{0,120},{0,160},{0,200},
+              {30,200},{60,200},{90,200},{120,200},
+              {121,210},{120,218}}; /* 长横线末端 18px 下钩，不应产生第三段 */
+    const char *keys[] = {"26", "262", "2"};
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), 0);
 }
 
-/* ---------------- rec_match ---------------- */
-
-UTEST(match, exact)
+UTEST(match_path, unfinished_turn_does_not_execute_prefix)
 {
-    const char *keys[] = {"2", "26", "4"};
-    ASSERT_EQ(rec_match("26", keys, 3, 0), 1);
-}
-
-UTEST(match, exact_none)
-{
+    Pt p[] = {{0,0},{0,40},{0,80},{0,120},{0,160},{0,200},
+              {8,200},{16,200},{25,200}}; /* 转向阈值40；25px已像转向但尚未确认 */
     const char *keys[] = {"2", "26"};
-    ASSERT_EQ(rec_match("8", keys, 2, 0), -1);
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), -1);
+    ASSERT_EQ(r.index, -1);
 }
 
-UTEST(match, fuzzy_picks_nearest)
+UTEST(match_path, long_first_leg_short_turn_never_executes_prefix)
 {
-    const char *keys[] = {"26", "2"};   /* "266": 距"26"=1, 距"2"=2 */
-    ASSERT_EQ(rec_match("266", keys, 2, 1), 0);
+    /* 旧逻辑：确认阈值为 120px，60px 又没到其 60%，被静默删除并以 100 分执行 2。 */
+    Pt p[] = {{0,0},{0,100},{0,200},{0,300},{0,400},{0,500},
+              {0,600},{0,700},{0,800},{0,900},{0,1000},
+              {20,1000},{40,1000},{60,1000}};
+    const char *keys[] = {"2", "26"};
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), -1);
+    ASSERT_EQ(r.index, -1);
 }
 
-UTEST(match, tie_prefers_shorter)
+UTEST(match_path, short_hook_without_configured_continuation_keeps_straight)
 {
-    const char *a[] = {"264", "2"};     /* 距各=1；更短 "2" 胜 */
-    ASSERT_EQ(rec_match("26", a, 2, 1), 1);
-    const char *b[] = {"2", "264"};     /* 换序，更短者仍胜 */
-    ASSERT_EQ(rec_match("26", b, 2, 1), 0);
+    Pt p[] = {{0,0},{0,100},{0,200},{0,300},{0,400},{0,500},
+              {0,600},{0,700},{0,800},{0,900},{0,1000},
+              {20,1000},{40,1000},{60,1000}};
+    const char *keys[] = {"2"};
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), 0);
 }
 
-UTEST(match, tie_equal_len_prefers_earlier)
+UTEST(match_path, boundary_direction_is_rejected_as_ambiguous)
 {
-    const char *keys[] = {"6", "2"};    /* 距各=1、同长 → 取更前 */
-    ASSERT_EQ(rec_match("26", keys, 2, 1), 0);
+    /* 约 22.5°，恰在右(6)与右下(3)之间。旧量化只能武断选一边。 */
+    Pt p[] = {{0,0},{20,8},{40,17},{60,25},{80,33},{100,41}};
+    const char *keys[] = {"6", "3"};
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), -1);
+    ASSERT_TRUE(r.score >= 82);
+    ASSERT_TRUE(r.score - r.second_score < 6);
 }
 
-/*
- * 空串不是手势，任何 Tolerance 下都不许命中。
- *
- * 曾经的行为：lev("", "1") == 1，故 Tolerance>=1 时空串命中任意单段模板，
- * 且「平票取短 + 取前」保证必中 [Gestures] 里第一条单字符手势（发布配置中是
- * `1 = cmd:minimize`）。触发它不需要划手势——TriggerDistance(5) 就进 Active，
- * 而分段要到 MinDistance(20)，中间这段「死区」里 rec_encode 产出的正是空串。
- * 于是一次手抖的右键点击就会把当前窗口最小化。
- * 容错的语义是「画歪了也认」，不是「没画也认」。
- */
-UTEST(match, empty_seq_never_matches)
+UTEST(match_path, clear_nearest_direction_is_accepted)
 {
-    const char *keys[] = {"1", "2", "26"};
-    /* 上界取 config.h 的 CFG_MAX_TOLERANCE(=4)；此处不引 config.h，保持
-     * recognizer 测试与 config 模块解耦。 */
-    for (int tol = 0; tol <= 4; tol++)
-        ASSERT_EQ(rec_match("", keys, 3, tol), -1);
+    Pt p[] = {{0,0},{25,7},{50,13},{75,20},{100,27}}; /* 约 15°，明确偏右 */
+    const char *keys[] = {"6", "3"};
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), 0);
 }
 
-UTEST(match, null_seq_never_matches)
+UTEST(match_path, low_score_is_rejected_even_with_one_template)
 {
-    const char *keys[] = {"1", "2"};
-    ASSERT_EQ(rec_match(NULL, keys, 2, 1), -1);
+    Pt p[] = {{0,0},{-25,0},{-50,0},{-75,0},{-100,0}};
+    const char *keys[] = {"6"};
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), -1);
+    ASSERT_TRUE(r.score < 82);
+}
+
+UTEST(match_path, wide_steep_v_prefers_visual_topology)
+{
+    Pt p[256];
+    size_t n = make_v(p, NELEMS(p), 75, 200, 2);
+    const char *keys[] = {"28", "39"};
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, n, 20, keys, NELEMS(keys), 82, 6, &r), 1);
+    ASSERT_EQ(r.index, 1);
+}
+
+UTEST(match_path, narrow_down_up_remains_28)
+{
+    Pt p[] = {{0,0},{2,20},{4,40},{6,60},{8,80},{10,100},
+              {12,80},{14,60},{16,40},{18,20},{20,0}};
+    const char *keys[] = {"28", "39"};
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), 0);
+}
+
+UTEST(match_path, topology_bonus_is_continuous_across_old_pixel_boundary)
+{
+    Pt below[] = {{0,0},{20,100},{39,0}};
+    Pt above[] = {{0,0},{21,100},{41,0}};
+    const char *keys[] = {"39"};
+    RecMatchResult a, b;
+    ASSERT_EQ(rec_match_path(below, NELEMS(below), 20, keys, 1, 0, 0, &a), 0);
+    ASSERT_EQ(rec_match_path(above, NELEMS(above), 20, keys, 1, 0, 0, &b), 0);
+    int difference = a.score > b.score ? a.score - b.score : b.score - a.score;
+    ASSERT_TRUE(difference <= 3); /* 旧硬阈值会在这里跳变约 18 分 */
+}
+
+UTEST(match_path, no_effective_segment_never_matches)
+{
+    Pt p[] = {{0,0},{4,2},{7,-2},{9,1}};
+    const char *keys[] = {"6", "2", "26"};
+    RecMatchResult r;
+    ASSERT_FALSE(rec_has_gesture(p, NELEMS(p), 20));
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 1, 0, &r), -1);
+    ASSERT_EQ(r.index, -1);
+}
+
+UTEST(match_path, invalid_templates_are_ignored)
+{
+    Pt p[] = {{0,0},{25,0},{50,0},{75,0},{100,0}};
+    const char *keys[] = {"hello", "5", "6"};
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), 2);
+}
+
+UTEST(match_path, equivalent_templates_do_not_create_false_ambiguity)
+{
+    Pt p[] = {{0,0},{25,0},{50,0},{75,0},{100,0}};
+    const char *keys[] = {"6", "66"};
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), 0);
+    ASSERT_EQ(r.score, 100);
+    ASSERT_EQ(r.second_score, 0);
+}
+
+UTEST(match_path, randomized_cardinal_and_diagonal_matrix)
+{
+    const char *keys[] = {"1", "2", "3", "4", "6", "7", "8", "9"};
+    Pt p[256];
+    char msg[96];
+    for (int expected = 0; expected < 8; expected++) {
+        for (unsigned variant = 1; variant <= 20; variant++) {
+            size_t n = make_key_path(p, NELEMS(p), keys[expected],
+                                     150, 14, 3, variant * 97u + (unsigned)expected);
+            RecMatchResult r;
+            int got = rec_match_path(p, n, 20, keys, NELEMS(keys), 82, 6, &r);
+            snprintf(msg, sizeof(msg), "方向%s 随机变体%u score=%d second=%d",
+                     keys[expected], variant, r.score, r.second_score);
+            ASSERT_EQ_MSG(got, expected, msg);
+        }
+    }
+}
+
+UTEST(match_path, randomized_multisegment_matrix)
+{
+    const char *keys[] = {"1", "2", "3", "4", "6", "7", "8", "9",
+                          "26", "39", "86"};
+    const char *patterns[] = {"26", "39", "86"};
+    const int expected[] = {8, 9, 10};
+    Pt p[256];
+    char msg[112];
+    for (int k = 0; k < 3; k++) {
+        for (unsigned variant = 1; variant <= 24; variant++) {
+            size_t n = make_key_path(p, NELEMS(p), patterns[k],
+                                     170, 12, 3, variant * 193u + (unsigned)k);
+            RecMatchResult r;
+            int got = rec_match_path(p, n, 20, keys, NELEMS(keys), 82, 6, &r);
+            snprintf(msg, sizeof(msg), "手势%s 随机变体%u score=%d second=%d",
+                     patterns[k], variant, r.score, r.second_score);
+            ASSERT_EQ_MSG(got, expected[k], msg);
+        }
+    }
 }
 
 UTEST_MAIN();

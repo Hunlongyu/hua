@@ -17,7 +17,6 @@ static HHOOK      g_hook;
 static HWND       g_notify;
 static HuaTrigger g_trigger;
 static int        g_trigger_dist = 5;    /* 进入 Active 的阈值 */
-static int        g_min_dist = 20;       /* 方向分段阈值 */
 static int        g_step_dist = 12;      /* 采点去抖 */
 
 static HookGateFn g_gate;
@@ -38,7 +37,6 @@ static Pt         g_start;
 static Pt         g_last_pos;
 static HWND       g_target;
 static HWND       g_foreground_at_down;
-static char       g_seq[REC_MAX_SEQ];   /* 最近识别到的方向串 */
 
 /* ---------------- 触发键判定 ---------------- */
 
@@ -211,9 +209,8 @@ static LRESULT handle_event(WPARAM msg, const MSLLHOOKSTRUCT *ms)
             return 1;
         }
         if (g_state == ST_ACTIVE) {
-            /* 成手势 → 编码方向串，交主线程匹配执行，吞掉 Up。 */
+            /* 成手势 → 原始点交主线程做几何匹配，吞掉 Up。 */
             g_state = ST_IDLE;
-            rec_encode(g_pts, g_npts, g_min_dist, g_seq, sizeof(g_seq));
             PostMessage(g_notify, WM_HUA_HOOK, HUA_EV_GESTURE_END, 0);
             return 1;
         }
@@ -241,14 +238,13 @@ static LRESULT CALLBACK low_level_mouse_proc(int nCode, WPARAM wParam, LPARAM lP
 /* ---------------- 安装 / 卸载 / 访问器 ---------------- */
 
 bool hook_install(HWND notify_hwnd, HuaTrigger trigger,
-                  int trigger_dist, int min_dist, int step_dist)
+                  int trigger_dist, int step_dist)
 {
     if (g_hook)
         return true;
     g_notify      = notify_hwnd;
     g_trigger     = trigger;
     g_trigger_dist = trigger_dist > 0 ? trigger_dist : 5;
-    g_min_dist    = min_dist > 0 ? min_dist : 20;
     g_step_dist   = step_dist > 0 ? step_dist : 12;
     g_state       = ST_IDLE;
     g_suppress_trigger_up = false;
@@ -305,7 +301,6 @@ bool hook_looks_dead(void)
     return watchdog_should_reinstall(&g_wd_state, &s);
 }
 
-const char *hook_last_seq(void)   { return g_seq; }
 HWND        hook_last_target(void){ return g_target; }
 
 void hook_poll_cursor(void)

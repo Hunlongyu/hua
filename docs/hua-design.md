@@ -14,7 +14,7 @@
 | 决策 | 选定方案 | 理由 |
 |---|---|---|
 | 触发键 | **右键**，`.ini` 可切 `middle/x1/x2` | 最贴近 MouseInc 体验；代价是要实现"右键补发还原" |
-| 方向编码 | **8 方向九宫格数字 + 编辑距离容错** | 单字符统一、ini 整齐；容错让画歪也能识别 |
+| 手势识别 | **连续几何联合评分 + 九宫格模板语言** | 配置简洁；原始角度、转角与形状信息不丢失 |
 | 浮层显示 | **轨迹线 + 实时动作名 OSD** | 反馈最好，最接近 MouseInc 观感 |
 
 ---
@@ -55,7 +55,7 @@
 | 配置解析 | **inih**（benhoyt/inih，New BSD，~300 行单文件） | SAX 回调式，契合"边解析边建模型"；UTF-8 字节透明；弃用 ANSI 的 `GetPrivateProfileString`。备选 minIni（Apache-2.0，自带写回） |
 | 动作执行 | `SendInput` / `CreateProcessW` / `ShellExecuteW` | |
 | 字符集 | 内部统一 `wchar_t`(UTF-16)，文件 UTF-8 | 边界处转码 |
-| 单元测试 | `utest.h`（单头文件）+ CTest | 纯函数（识别、编辑距离、ini 解析）零依赖可测 |
+| 单元测试 | `utest.h`（单头文件）+ CTest | 纯函数（几何识别、拒识、ini 解析）零依赖可测 |
 
 **外部依赖：Win32 + GDI+（系统自带）。** 第三方仅以**源码内联**方式编译进来（inih 的 `ini.c/ini.h`、测试用 `utest.h`），无任何运行时 DLL 依赖。
 
@@ -73,7 +73,7 @@
 │ action      动作执行：key / run / cmd            │
 ├───────────────────────────────────────────────┤
 │ context     前台进程名获取、per-app 映射解析       │
-│ recognizer  采点 → 方向量化 → 序列压缩 → 编辑距离匹配 │
+│ recognizer  RDP → 向量分段/迟滞 → 多特征评分 → 拒识   │
 │ config      ini 解析 / 数据模型 / 热加载           │
 ├───────────────────────────────────────────────┤
 │ hook        WH_MOUSE_LL 钩子、触发状态机、右键还原  │
@@ -86,9 +86,9 @@
 
 ```
 右键按下 → hook 捕获、记录目标窗口 → 进入 Tentative
-   移动 → hook 采点入队 → 超过 MinDistance → 进入 Active，overlay 开始画线
-   移动 → recognizer 增量量化方向、压缩序列 → overlay 更新方向串/动作名
-右键松开 → recognizer 收尾匹配 → context 查 per-app → action 执行 → overlay 淡出
+   移动 → hook 采点入队 → 超过 TriggerDistance → 进入 Active，overlay 开始画线
+   移动 → 主线程快照原始点、几何匹配当前候选 → overlay 更新方向串/动作名
+右键松开 → recognizer 最终匹配 → config 解析候选动作 → action 执行 → overlay 淡出
          └ 若未移动：hook 补发原生右键（弹出系统菜单）
 ```
 
@@ -103,14 +103,14 @@
 **触发状态机：**
 
 ```
-Idle ──(触发键 Down)──► Tentative ──(移动>MinDistance)──► Active
+Idle ──(触发键 Down)──► Tentative ──(移动>TriggerDistance)──► Active
   ▲                        │                                 │
   │                        │(触发键 Up 且未移动)              │(触发键 Up)
   └────────────────────────┴────────────────►(执行/补发)─────┘
 ```
 
 - **Down**：记录起点坐标，**此刻用 `GetForegroundWindow()` 锁定目标窗口**（不能等到 Up，焦点可能已变），置 Tentative，**返回非 0 吞掉此按下事件**（先扣住，不放行）。
-- **Move**：距上一采样点 < `StepDistance` 则丢弃（去抖）；否则点入环形缓冲。累计位移首次超过 `MinDistance` → 置 Active，通知 overlay 开画。
+- **Move**：距上一采样点 < `StepDistance` 则丢弃（去抖）；否则点入环形缓冲。起点净位移首次超过 `TriggerDistance` → 置 Active，通知 overlay 开画。
 - **Up**：
   - 若从未进入 Active（只是点击）→ **补发原生右键**：`SendInput` 合成一对 down/up，让目标程序弹出右键菜单。
   - 若 Active 且识别命中 → 交给 action 执行，吞掉。
@@ -123,56 +123,55 @@ Idle ──(触发键 Down)──► Tentative ──(移动>MinDistance)──�
 
 **触发键映射**（`.ini` 的 `Trigger`）：`right→WM_RBUTTON*`、`middle→WM_MBUTTON*`、`x1/x2→WM_XBUTTON*`。中键/侧键路径**无需补发还原**（它们没有必须保留的原生菜单），实现更简单——这也是为什么把触发键做成可配。
 
-### 4.2 recognizer — 方向识别（纯函数，重点可测）
+### 4.2 recognizer — 连续几何识别（纯函数，重点可测）
 
-**方向量化（8 方向九宫格）：**
+配置仍用九宫格方向串描述模板，但它只是模板语言；最终识别直接使用原始二维轨迹，
+不再先量化成字符串。这样贴近扇区边界的一笔不会因为 1px 波动就彻底变成另一个手势。
 
-```
-输入：采样点序列 P[0..n]
-对相邻点 (P[i], P[i+1]) 求 angle = atan2(dy, dx)
-将 angle 量化到 8 个扇区，映射为九宫格数字：
-    8=上  2=下  4=左  6=右
-    7=左上 9=右上 1=左下 3=右下
-```
+**预处理与分段：**
 
-**序列压缩（抗抖动）：** 连续相同方向合并为一个；新方向只有在该方向上**持续累计位移超过 `MinDistance`** 才被采纳，避免手抖产生噪声段。输出如 `"6"`、`"26"`、`"2141"`。
+1. 最多保留 256 个输入点，给热路径确定的时间/栈空间上界；轨迹另行按弧长重采样为 32 个形状点。
+2. 用 Ramer–Douglas–Peucker 消除采样锯齿，容差由 `MinDistance × 0.42` 派生。
+3. 相邻向量夹角小于 22.5°时合并，以整段净向量决定连续方向。
+4. 新方向的确认距离为 `min(6×MinDistance, MinDistance + 上一段长度×0.10)`：前一笔越长，末端小钩越不容易被误判为转向。这一迟滞策略借鉴 FlowMouse 的实际实现。达到 `MinDistance` 但尚未通过确认的末段不会丢失，而作为暂定证据再做一次候选评分：若它使另一个已配置手势成为最佳，则拒绝执行稳定轨迹的短前缀；没有对应延伸候选时仍可把小钩当噪声。
 
-**匹配（编辑距离容错）：**
-- 与手势表中每个 key（方向串）计算 **Levenshtein 距离**（标准 DP，串长 <10，开销可忽略）。
-- 取距离最小且 `<= Tolerance` 者为命中；`Tolerance=0` 即精确匹配。
-- 平票时优先更短模板 / ini 中更靠前者。
-- 两段折线额外保留连续位移：明显向右展开（宽度不低于高度 30%），且两臂垂直高度相差不过分（短臂至少为长臂 40%）的下—上折线才按视觉 V 归一为 `39`。近似原路下—上的轨迹仍为独立的 `28`，向下后近水平向右的轨迹仍为 `26`。该规则确定、可解释，不依赖训练数据。
+**联合评分：** 对每个有效模板分别计算以下代价，再换算为 0～100 分：
 
-> 为什么用编辑距离而非精确相等：用户很难每次都画出完全一致的段数，容忍"多/少一段或方向偏一档"能极大提升可用性。参考 `avkom/gesture-recognition` 的 8 方向 + 编辑距离思路。
+- 42%：按双方线段长度比例对齐后的连续角度差；
+- 18%：方向序列 DTW，吸收采样密度和转角位置差异；
+- 20%：相对转角 DTW，区分方向集合相同但转弯结构不同的轨迹；
+- 15%：起点平移、总弧长缩放后的 32 点整体形状差；
+- 5%：有效段数差异。
+
+不做旋转归一化，因为上/下/左/右本身就是动作语义；平移、速度、采样密度与整体尺寸不影响模板方向。
+明显张开的两段 V/尖括号另有对称的拓扑置信度，以区分陡 V 与近似原路折返；开口宽度、深度和两臂平衡度连续改变加分，不再跨过单个像素阈值就固定跳变 18 分，且仍须通过几何最低分。
+
+**拒识而不是猜测：**
+
+- 最佳分必须达到 `MatchScore`（默认 82）；
+- 最佳分必须领先第二名至少 `AmbiguityMargin`（默认 6）；
+- 任何一项不满足都不执行动作。位于两个方向正中间的轨迹因此会被明确拒绝，而不是由取整偶然选中一边。
 
 **接口（示意）：**
 
 ```c
-// recognizer.h —— 无 Win32 依赖，纯逻辑，便于单测
 typedef struct { int x, y; } Pt;
+typedef struct { int index, score, second_score; } RecMatchResult;
 
-// 点序列 → 方向串（调用方提供输出缓冲）
+bool rec_has_gesture(const Pt *pts, size_t n, int min_dist);
 size_t rec_encode(const Pt *pts, size_t n, int min_dist,
-                  char *out, size_t out_cap);
-
-// 编辑距离
-int    rec_levenshtein(const char *a, const char *b);
-
-// 在手势表中匹配，返回命中下标或 -1
-int    rec_match(const char *seq, const char *const *keys,
-                 size_t key_count, int tolerance);
+                  char *out, size_t out_cap); // 仅供 OSD/日志
+int rec_match_path(const Pt *pts, size_t n, int min_dist,
+                   const char *const *keys, size_t key_count,
+                   int min_score, int ambiguity_margin,
+                   RecMatchResult *result);
 ```
 
-**连贯多方向手势的准确率（重要）：** 方向序列法天生支持"一笔画、多转折"，一笔 `→↓←` 会被拆成 `624`。要让它稳，识别层必须做到三点：
-1. **段内方向用累计位移向量判定**（该段起点→当前点），而非逐点 `atan2`——逐点会在方向边界因手抖反复横跳，拆出噪声段。
-2. **转向滞回**：只有新方向上的累计位移超过 `MinDistance` 才确认为一次转折；短于阈值的段作为噪声抹掉。
-3. **编辑距离容错**：吸收 ±1 段的多画/少画/偏一档误差。
-
-实践边界：**2~5 段、方向拉得开的手势可稳定识别**；段数越多误判概率越累积；贴近 45° 对角边界的段易抖（该手势宜用正交方向或画得干脆）；圆弧/字母类连续曲线方向法不适用，需二期的 `$1` 模板匹配。
+实现使用固定大小栈数组，无堆分配、无训练过程、无模型文件和第三方运行库。实践目标仍是 1～5 段的方向型鼠标手势；圆、字母等自由曲线不在九宫格模板语言的表达范围内。
 
 ### 4.3 config — ini 数据模型与热加载
 
-- **解析器用 inih（不自研）**：SAX 回调 `handler(user, section, name, value)`，在回调里增量构建模型——天然适配重复的 `[App:xxx]` 节与每节任意方向串作 key。编译期开关 `INI_ALLOW_MULTILINE`/`INI_ALLOW_INLINE_COMMENTS` 等按需打开；UTF-8 按字节透明，启动时剥掉可能的 BOM。
+- **解析器用 inih（不自研）**：SAX 回调 `handler(user, section, name, value)`，在回调里增量构建模型。手势 key 只接受九宫格八方向，连续重复方向先折叠；同一节内标准化后重复的模板由最后定义覆盖并计入诊断。编译期开关 `INI_ALLOW_MULTILINE`/`INI_ALLOW_INLINE_COMMENTS` 等按需打开；UTF-8 按字节透明，启动时剥掉可能的 BOM。
 - 数据模型：`Config { General; Gesture[] global; App[] apps; }`，`App { name; Gesture[]; enabled; }`。
 - **写回**：inih 只读；唯一需持久化的是托盘切换 `AutoStart`，写回那一行自行处理（或改用 minIni 的 `ini_puts` 内建写）。
 - **热加载**：用 `ReadDirectoryChangesW` 或简单地在托盘菜单点"重载"时重读；一期先做手动重载 + 启动加载，二期加文件监听。
@@ -189,14 +188,15 @@ bool ctx_foreground_exe(HWND hwnd, wchar_t *out, size_t cap);
 
 **全屏检测**（`DisableOnFullscreen=true` 时，触发前先判）：优先用 `SHQueryUserNotificationState()`，返回 `QUNS_RUNNING_D3D_FULL_SCREEN` 或 `QUNS_PRESENTATION_MODE` 视为全屏；再辅以几何比对——前台窗口矩形是否覆盖整块显示器且非桌面外壳（排除 `Progman`/`WorkerW`/任务栏），以覆盖无边框全屏游戏和网页全屏视频。命中则本次手势不触发。
 
-**解析优先级**（识别出方向串 `seq`、目标窗口 `hwnd` 后）：
+**解析优先级**（取得原始轨迹 `points`、目标窗口 `hwnd` 后）：
 
 ```
 exe = ctx_foreground_exe(hwnd)
 if DisableOnFullscreen 且 前台为全屏:         不触发
 if FilterMode == whitelist 且 无 [App:exe]:  不触发
 if [App:exe].enabled == false:               不触发（黑名单特例）
-action = [App:exe].lookup(seq)  ?? [Gestures].lookup(seq)   // 程序覆盖 > 全局默认
+candidates = [App:exe] + 未被同 key 覆盖的 [Gestures]
+action = recognizer.match(points, candidates)               // 同一评分空间竞争
 ```
 
 > **设计取舍**：把"黑白名单"降级为 per-app 的特例（`Enabled=false` 或 whitelist 模式），避免两套并行概念。Per-app 映射本身比黑白名单更强——它决定"同手势不同动作"，而不仅是"生效与否"。全屏禁用是独立于名单的一道前置开关。
@@ -251,7 +251,8 @@ Trigger         = right      ; right | middle | x1 | x2
 TriggerDistance = 5          ; 按下后移动多远（px）才开始手势
 MinDistance     = 20         ; 方向分段阈值（识别灵敏度，越小越灵敏）
 StepDistance    = 12         ; 采点最小间隔像素（去抖）
-Tolerance       = 0          ; 方向串匹配最大编辑距离（0=精确，本项目默认）
+MatchScore      = 82         ; 几何匹配最低分（越高越严格）
+AmbiguityMargin = 6          ; 最佳候选至少领先第二名多少分
 PauseTimeout    = 1000       ; 鼠标停顿超过此毫秒数则取消手势
 FilterMode      = blacklist  ; blacklist | whitelist
 DisableOnFullscreen = true   ; 全屏程序中禁用手势
@@ -275,7 +276,7 @@ TrailWidth      = 3          ; 轨迹线宽
 TextSize        = 26         ; 动作名字号
 TextPosition    = 150        ; 动作名距屏幕底部高度（px）
 
-; ---------- 全局默认手势：方向串 = 动作（按九宫格数字升序） ----------
+; ---------- 全局默认手势：方向串 = 动作（重复方向会折叠，非法/重复项写日志） ----------
 [Gestures]
 1  = cmd:minimize         ; ↙ 左下    最小化
 2  = cmd:scroll_bottom    ; ↓ 下      滚动到底部
@@ -287,8 +288,8 @@ TextPosition    = 150        ; 动作名距屏幕底部高度（px）
 9  = cmd:toggle_maximize  ; ↗ 右上    最大化 / 还原（切换）
 26 = cmd:close_window     ; ↓→ 下右   关闭窗口
 
-; 注意：2(向下) 与 26(下右) 为前缀关系。执行时按整体匹配不冲突，
-; 但 Tolerance=1 时画不干脆可能互相误识别；追求零歧义可设 Tolerance=0。
+; 注意：2(向下) 与 26(下右) 为前缀关系。最终按完整原始轨迹联合评分；
+; 候选过于接近时由 AmbiguityMargin 拒识，不猜测其中一个。
 
 ; ---------- 程序专属覆盖 ----------
 [App:chrome.exe]
@@ -317,7 +318,7 @@ hua/
 ├─ src/
 │  ├─ main.c                  # app：入口 / 消息循环 / 托盘 / 单实例
 │  ├─ hook.c  hook.h          # WH_MOUSE_LL、触发状态机、右键还原
-│  ├─ recognizer.c .h         # 采点/量化/压缩/编辑距离（纯逻辑）
+│  ├─ recognizer.c .h         # RDP/分段/DTW/形状评分与拒识（纯逻辑）
 │  ├─ config.c .h             # ini 解析 / 数据模型 / 热加载
 │  ├─ context.c .h            # 前台 exe / per-app 解析
 │  ├─ action.c .h             # key / run / cmd
@@ -327,7 +328,7 @@ hua/
 │  ├─ ini.c  ini.h            # inih（benhoyt/inih，New BSD）
 │  └─ utest.h                 # 单头测试框架
 ├─ tests/
-│  ├─ test_recognizer.c       # 方向串 / 编辑距离 / 匹配
+│  ├─ test_recognizer.c       # 分段 / 几何匹配 / 歧义拒识 / 随机矩阵
 │  └─ test_config.c           # ini 解析边界用例
 └─ .github/workflows/
    └─ build.yml               # 构建 + 打包 + Release
@@ -363,9 +364,9 @@ jobs:
 纯逻辑层是测试重点（无 Win32、可脱离系统运行）：
 
 - **recognizer**
-  - 点序列 → 方向串：直线各方向、L 形、Z 形、含抖动噪声点。
-  - 编辑距离：对称性、空串、增删改各一步。
-  - 匹配：精确命中、容错命中（距离=1）、超阈值不命中、平票取短。
+  - RDP/迟滞分段：直线各方向、L/Z/V、真实用户轨迹、短尾钩和含抖动噪声点。
+  - 几何匹配：尺寸/采样密度不变性、方向边界歧义拒识、最低分拒识。
+  - 232 组确定性随机变体：八个单方向与默认多段手势的角度、长度、密度、噪声矩阵。
 - **config**
   - 正常解析、缺失可选项取默认、坏行跳过、UTF-8 中文动作名/路径、`[App:x]` 覆盖优先级、`Enabled=false`。
 - **context / hook / overlay / action**：依赖系统 API，用手动冒烟测试清单（见下）覆盖，不做自动化单测。
@@ -376,16 +377,16 @@ jobs:
 
 ## 9. 里程碑
 
-> 状态（截至实现）：**M1–M6 全部完成**。纯逻辑层 51 个单元测试（recognizer/action/config）全绿；
-> Win32 层（hook/context/overlay/action 执行/autostart）经手动冒烟。M7 未做（可选）。
+> 状态（截至实现）：**M1–M7 全部完成**。纯逻辑测试覆盖识别、配置、动作和系统无关辅助逻辑；
+> Win32 层（hook/context/overlay/action 执行/autostart）经手动冒烟。
 
 1. ✅ **M1 骨架跑通**：托盘 + message-only 窗口 + 单实例 + 钩子装卸 + 日志。
-2. ✅ **M2 识别闭环**：采点 → 方向串 → 精确匹配 → `cmd:`/`key:` 动作；右键补发还原。
+2. ✅ **M2 识别闭环**：采点 → 几何匹配 → `cmd:`/`key:` 动作；右键补发还原。
 3. ✅ **M3 配置化**：inih 解析 + 数据模型 + `Trigger`/阈值可配 + 托盘重载。
-4. ✅ **M4 增强**：编辑距离容错 + per-app 映射 + 黑白名单 + 全屏门控。
+4. ✅ **M4 增强**：per-app 映射 + 黑白名单 + 全屏门控。
 5. ✅ **M5 浮层**：GDI+ 抗锯齿轨迹线 + 箭头 + 实时动作名 OSD + 淡出（自绘 flat C 声明）。
 6. ✅ **M6 打磨**：热加载（`FindFirstChangeNotification`）、DPI 感知（PerMonitorV2）、开机自启（schtasks）、CI 发布、README。
-7. **（可选）M7**：接 `htfy96/dollar` 的 `$1` 识别，支持任意形状手势。**（未做）**
+7. ✅ **M7 几何识别重构**：RDP + 自适应转向迟滞 + 连续角度/DTW/转角/形状联合评分 + 双阈值拒识。
 
 ---
 
@@ -404,8 +405,9 @@ jobs:
 
 - MouseInc 手册 — https://docs.shuax.com/MouseInc/
 - Aitiy（MouseInc 作者新作） — https://aitiy.com/
-- `$1` Unistroke Recognizer（华盛顿大学） — https://depts.washington.edu/acelab/proj/dollar/
-- `htfy96/dollar`（C++17 的 `$1` 实现） — https://github.com/htfy96/dollar
-- `avkom/gesture-recognition`（8 方向 + 编辑距离，可照抄算法） — https://github.com/avkom/gesture-recognition
+- Gesturefy（连续向量、比例匹配与 DTW 的浏览器手势实现） — https://github.com/Robbendebiene/Gesturefy
+- FlowMouse（四方向与自适应转向阈值的浏览器手势实现） — https://github.com/Hmily-LCG/FlowMouse
+- Chance-fyi/mouse-gestures（RDP、关键点与多特征匹配） — https://github.com/Chance-fyi/mouse-gestures
+- Foxy Gestures（方向迟滞与非均匀扇区参考） — https://github.com/marklieberman/foxygestures
 - Easystroke（Linux C++ 手势工具，架构参考） — https://github.com/thjaeger/easystroke
 ```

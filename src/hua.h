@@ -27,7 +27,7 @@
 /* WM_HUA_HOOK 的 wParam 取值 */
 enum {
     HUA_EV_GESTURE_BEGIN = 1,   /* 触发键按下，启动轮询与浮层绘制 */
-    HUA_EV_GESTURE_END   = 2,   /* 触发键抬起且识别完成，主线程取方向串→匹配→执行 */
+    HUA_EV_GESTURE_END   = 2,   /* 触发键抬起，主线程取原始轨迹→几何匹配→执行 */
     HUA_EV_GESTURE_CANCEL = 3,  /* 仅普通点击，停止轮询且不执行手势 */
 };
 
