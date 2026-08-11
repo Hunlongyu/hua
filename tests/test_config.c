@@ -236,6 +236,19 @@ UTEST(config, invalid_gesture_keys_are_reported_and_dropped)
     ASSERT_STREQ(c.diag.first_issue, "5");
 }
 
+UTEST(config, gesture_key_length_boundary_is_enforced_after_normalization)
+{
+    Config c;
+    ASSERT_TRUE(config_parse_string(&c,
+        "[Gestures]\n"
+        "262626262626262=cmd:close_window\n"  /* 15 个字符：可存储 */
+        "2626262626262626=key:f5\n"));        /* 16 个字符：超出 CFG_MAX_KEY */
+    ASSERT_EQ((int)c.gesture_count, 1);
+    ASSERT_STREQ(c.gestures[0].key, "262626262626262");
+    ASSERT_EQ(c.diag.invalid_gestures, 1);
+    ASSERT_STREQ(c.diag.first_issue, "2626262626262626");
+}
+
 UTEST(config, inline_comment_stripped)
 {
     Config c;
@@ -267,6 +280,33 @@ UTEST(config, app_override_and_enabled)
     const AppConfig *game = config_find_app(&c, "game.exe");
     ASSERT_TRUE(game != NULL);
     ASSERT_FALSE(game->enabled);
+}
+
+UTEST(config, app_gesture_keys_are_normalized_deduplicated_and_validated)
+{
+    Config c;
+    ASSERT_TRUE(config_parse_string(&c,
+        "[Gestures]\n6=global\n"
+        "[App:chrome.exe]\n"
+        "66=first\n"
+        "666=last\n"
+        "5=invalid\n"));
+
+    const AppConfig *chrome = config_find_app(&c, "chrome.exe");
+    ASSERT_TRUE(chrome != NULL);
+    ASSERT_EQ((int)chrome->gesture_count, 1);
+    ASSERT_STREQ(chrome->gestures[0].key, "6");
+    ASSERT_STREQ(chrome->gestures[0].action, "last");
+    ASSERT_EQ(c.diag.duplicate_gestures, 1);
+    ASSERT_EQ(c.diag.invalid_gestures, 1);
+
+    Pt p[] = {{0,0},{25,0},{50,0},{75,0},{100,0}};
+    char key[REC_MAX_SEQ];
+    RecMatchResult r;
+    ASSERT_STREQ(config_resolve_path(&c, "chrome.exe", p,
+                                     sizeof(p) / sizeof(p[0]), key, sizeof(key), &r),
+                 "last");
+    ASSERT_STREQ(key, "6");
 }
 
 UTEST(config, app_section_prefix_case_insensitive)
@@ -476,6 +516,34 @@ UTEST(resolve, raw_path_none_still_reports_a_match)
                                     sizeof(p) / sizeof(p[0]), key, sizeof(key), &r) == NULL);
     ASSERT_STREQ(key, "39");
     ASSERT_TRUE(r.index >= 0); /* NULL 是显式无动作，不是识别失败 */
+}
+
+UTEST(resolve, unfinished_dangerous_v_never_executes_diagonal_prefix)
+{
+    Config c;
+    config_parse_string(&c,
+        "[Gestures]\n"
+        "3=key:delete\n"
+        "39=key:f5\n");
+
+    /* 第一臂约 990px，转向确认阈值约 119px；60px 的反向尾巴只算意图。 */
+    Pt unfinished[] = {{0,0},{140,140},{280,280},{420,420},{560,560},{700,700},
+                       {714,686},{728,672},{742,658}};
+    char key[REC_MAX_SEQ];
+    RecMatchResult r;
+    ASSERT_TRUE(config_resolve_path(&c, "notepad.exe", unfinished,
+                                    sizeof(unfinished) / sizeof(unfinished[0]),
+                                    key, sizeof(key), &r) == NULL);
+    ASSERT_EQ(r.index, -1);
+
+    /* 超过 120px 后第二臂确认，完整 V 才允许执行 F5。 */
+    Pt finished[] = {{0,0},{140,140},{280,280},{420,420},{560,560},{700,700},
+                     {730,670},{760,640},{790,610}};
+    ASSERT_STREQ(config_resolve_path(&c, "notepad.exe", finished,
+                                     sizeof(finished) / sizeof(finished[0]),
+                                     key, sizeof(key), &r),
+                 "key:f5");
+    ASSERT_STREQ(key, "39");
 }
 
 /* ---------------- 布尔值回落（与数值的 fallback_clamp 同一哲学） ---------------- */

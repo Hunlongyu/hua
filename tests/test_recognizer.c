@@ -4,6 +4,7 @@
 #include "recognizer.h"
 #include "utest.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 
@@ -285,6 +286,11 @@ UTEST(encode, v_from_user_log_is_39)
     char buf[64];
     rec_encode(p, NELEMS(p), 20, buf, sizeof(buf));
     ASSERT_STREQ(buf, "39");
+
+    const char *keys[] = {"28", "39", "29"};
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), 1);
+    ASSERT_TRUE(r.score >= 82);
 }
 
 /* 向下后向右的关闭手势允许末段略微上扬；它只有几像素的“升高”，不构成 V。 */
@@ -400,6 +406,13 @@ UTEST(template, normalize_and_validate)
     ASSERT_EQ((int)rec_normalize_template("", key, sizeof(key)), 0);
 }
 
+UTEST(template, insufficient_output_buffer_is_rejected_atomically)
+{
+    char key[3] = {'x', 'x', '\0'};
+    ASSERT_EQ((int)rec_normalize_template("262", key, sizeof(key)), 0);
+    ASSERT_STREQ(key, "");
+}
+
 /* ---------------- 连续几何匹配 ---------------- */
 
 UTEST(match_path, canonical_L_selects_26)
@@ -445,6 +458,24 @@ UTEST(match_path, unfinished_turn_does_not_execute_prefix)
     ASSERT_EQ(r.index, -1);
 }
 
+UTEST(match_path, adaptive_turn_threshold_matrix)
+{
+    const char *keys[] = {"2", "26"};
+    const int tails[] = {0, 19, 20, 25, 39, 40};
+    const int expected[] = {0, 0, -1, -1, -1, 1};
+    char msg[96];
+
+    for (size_t i = 0; i < NELEMS(tails); i++) {
+        Pt p[] = {{0,0},{0,40},{0,80},{0,120},{0,160},{0,200},
+                  {tails[i],200}};
+        RecMatchResult r;
+        int got = rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r);
+        snprintf(msg, sizeof(msg), "首段200px、末段%dpx，应命中候选索引%d",
+                 tails[i], expected[i]);
+        ASSERT_EQ_MSG(got, expected[i], msg);
+    }
+}
+
 UTEST(match_path, long_first_leg_short_turn_never_executes_prefix)
 {
     /* 旧逻辑：确认阈值为 120px，60px 又没到其 60%，被静默删除并以 100 分执行 2。 */
@@ -463,6 +494,16 @@ UTEST(match_path, short_hook_without_configured_continuation_keeps_straight)
               {0,600},{0,700},{0,800},{0,900},{0,1000},
               {20,1000},{40,1000},{60,1000}};
     const char *keys[] = {"2"};
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), 0);
+}
+
+UTEST(match_path, short_unconfigured_opposite_turn_keeps_straight)
+{
+    Pt p[] = {{0,0},{0,100},{0,200},{0,300},{0,400},{0,500},
+              {0,600},{0,700},{0,800},{0,900},{0,1000},
+              {-20,1000},{-40,1000},{-60,1000}};
+    const char *keys[] = {"2", "26"}; /* 只配置向右延伸，实际短尾巴向左。 */
     RecMatchResult r;
     ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), 0);
 }
@@ -524,6 +565,23 @@ UTEST(match_path, topology_bonus_is_continuous_across_old_pixel_boundary)
     ASSERT_EQ(rec_match_path(above, NELEMS(above), 20, keys, 1, 0, 0, &b), 0);
     int difference = a.score > b.score ? a.score - b.score : b.score - a.score;
     ASSERT_TRUE(difference <= 3); /* 旧硬阈值会在这里跳变约 18 分 */
+}
+
+UTEST(match_path, topology_score_changes_smoothly_over_full_boundary_band)
+{
+    const char *keys[] = {"39"};
+    int previous = -1;
+    for (int width = 24; width <= 56; width++) {
+        Pt p[] = {{0,0},{width / 2,100},{width,0}};
+        RecMatchResult r;
+        ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, 1, 0, 0, &r), 0);
+        ASSERT_TRUE(r.score >= 0 && r.score <= 100);
+        if (previous >= 0) {
+            int difference = r.score > previous ? r.score - previous : previous - r.score;
+            ASSERT_TRUE(difference <= 3);
+        }
+        previous = r.score;
+    }
 }
 
 UTEST(match_path, no_effective_segment_never_matches)
@@ -591,6 +649,89 @@ UTEST(match_path, randomized_multisegment_matrix)
             ASSERT_EQ_MSG(got, expected[k], msg);
         }
     }
+}
+
+UTEST(match_path, maximum_input_and_candidate_load_is_deterministic)
+{
+    enum { POINT_COUNT = 4096, CANDIDATE_COUNT = 192 };
+    static Pt p[POINT_COUNT];
+    static char storage[CANDIDATE_COUNT][16];
+    const char *keys[CANDIDATE_COUNT];
+    const char digits[] = "12346789";
+
+    for (int i = 0; i < POINT_COUNT; i++) {
+        p[i].x = i * 2;
+        p[i].y = (i % 7 == 0) ? 1 : 0;
+    }
+    snprintf(storage[0], sizeof(storage[0]), "6");
+    keys[0] = storage[0];
+    for (int i = 1; i < CANDIDATE_COUNT; i++) {
+        unsigned value = (unsigned)(i - 1);
+        char previous = '\0';
+        for (int j = 0; j < 7; j++) {
+            unsigned radix = j == 0 ? 8u : 7u;
+            unsigned choice = value % radix;
+            value /= radix;
+            char digit = '\0';
+            for (int d = 0; d < 8; d++) {
+                if (digits[d] == previous)
+                    continue;
+                if (choice == 0u) {
+                    digit = digits[d];
+                    break;
+                }
+                choice--;
+            }
+            storage[i][j] = digit;
+            previous = digit;
+        }
+        storage[i][7] = '\0';
+        keys[i] = storage[i];
+    }
+
+    RecMatchResult first, second;
+    ASSERT_EQ(rec_match_path(p, POINT_COUNT, 20, keys, CANDIDATE_COUNT, 82, 6, &first), 0);
+    ASSERT_EQ(rec_match_path(p, POINT_COUNT, 20, keys, CANDIDATE_COUNT, 82, 6, &second), 0);
+    ASSERT_EQ(first.index, second.index);
+    ASSERT_EQ(first.score, second.score);
+    ASSERT_EQ(first.second_score, second.second_score);
+    ASSERT_TRUE(first.score >= 0 && first.score <= 100);
+    ASSERT_TRUE(first.second_score >= 0 && first.second_score <= 100);
+}
+
+UTEST(match_path, deterministic_paths_are_translation_invariant)
+{
+    const char *keys[] = {"1", "2", "3", "4", "6", "7", "8", "9",
+                          "26", "39", "86"};
+    const char *patterns[] = {"1", "6", "9", "26", "39", "86"};
+    Pt original[256], translated[256];
+
+    for (size_t k = 0; k < NELEMS(patterns); k++) {
+        for (unsigned variant = 1; variant <= 12; variant++) {
+            size_t n = make_key_path(original, NELEMS(original), patterns[k],
+                                     160, 12, 3, variant * 911u + (unsigned)k);
+            for (size_t i = 0; i < n; i++) {
+                translated[i].x = original[i].x + 10000;
+                translated[i].y = original[i].y - 7000;
+            }
+            RecMatchResult a, b;
+            int ia = rec_match_path(original, n, 20, keys, NELEMS(keys), 82, 6, &a);
+            int ib = rec_match_path(translated, n, 20, keys, NELEMS(keys), 82, 6, &b);
+            ASSERT_EQ(ia, ib);
+            ASSERT_EQ(a.score, b.score);
+            ASSERT_EQ(a.second_score, b.second_score);
+        }
+    }
+}
+
+UTEST(match_path, extreme_integer_coordinates_remain_bounded)
+{
+    Pt p[] = {{INT_MIN,INT_MIN},{0,0},{INT_MAX,INT_MAX}};
+    const char *keys[] = {"3", "7"};
+    RecMatchResult r;
+    ASSERT_EQ(rec_match_path(p, NELEMS(p), 20, keys, NELEMS(keys), 82, 6, &r), 0);
+    ASSERT_TRUE(r.score >= 0 && r.score <= 100);
+    ASSERT_TRUE(r.second_score >= 0 && r.second_score <= 100);
 }
 
 UTEST_MAIN();

@@ -3,7 +3,7 @@
 > **hua（划）** — "划一下"即手势的动作本身。Windows 平台、纯 C、无 GUI（仅托盘）、`.ini` 配置的鼠标手势工具。
 > 目标是复刻 MouseInc / Aitiy 的**手势子集**，去掉截图、翻译、贴图等一切额外功能。
 
-文档版本 v0.5 ｜ 平台 Windows 10/11 ｜ 语言 C17 ｜ 构建 CMake + GitHub Actions
+文档版本 v0.6 ｜ 平台 Windows 10/11 ｜ 语言 C17 ｜ 构建 CMake + GitHub Actions
 
 ---
 
@@ -35,9 +35,8 @@
 
 ### 1.2 非目标（Out of Scope）
 - 截图、OCR、贴图、翻译、超级拖拽、滚轮增强等 MouseInc 的其余功能。
-- 任意形状手势识别（画圆、画字母）——一期只做方向序列；二期可选接 `$1` 模板匹配。
+- 任意形状手势识别（画圆、画字母）——当前只支持九宫格方向模板；连续几何评分不会扩大模板语言的表达范围。
 - 跨平台。仅 Windows。
-- 多显示器 DPI 完美适配——一期保证主屏正确，高 DPI 做基础处理。
 
 ---
 
@@ -55,9 +54,9 @@
 | 配置解析 | **inih**（benhoyt/inih，New BSD，~300 行单文件） | SAX 回调式，契合"边解析边建模型"；UTF-8 字节透明；弃用 ANSI 的 `GetPrivateProfileString`。备选 minIni（Apache-2.0，自带写回） |
 | 动作执行 | `SendInput` / `CreateProcessW` / `ShellExecuteW` | |
 | 字符集 | 内部统一 `wchar_t`(UTF-16)，文件 UTF-8 | 边界处转码 |
-| 单元测试 | `utest.h`（单头文件）+ CTest | 纯函数（几何识别、拒识、ini 解析）零依赖可测 |
+| 单元测试 | `utest.h`（单头文件）+ CTest | 纯函数（几何识别、拒识、ini 解析、动作解析、探活判定）零依赖可测 |
 
-**外部依赖：Win32 + GDI+（系统自带）。** 第三方仅以**源码内联**方式编译进来（inih 的 `ini.c/ini.h`、测试用 `utest.h`），无任何运行时 DLL 依赖。
+**运行时依赖仅为 Windows 系统组件**（Win32、GDI+、WinHTTP、bcrypt 等）。inih、winautoupdate 及其 cJSON/semver 依赖均以源码静态编译；`utest.h` 只参与测试，不进入正式产物。无需 VC++ 运行库或其他第三方 DLL。
 
 ---
 
@@ -158,6 +157,7 @@ Idle ──(触发键 Down)──► Tentative ──(移动>TriggerDistance)─
 typedef struct { int x, y; } Pt;
 typedef struct { int index, score, second_score; } RecMatchResult;
 
+size_t rec_normalize_template(const char *key, char *out, size_t out_cap);
 bool rec_has_gesture(const Pt *pts, size_t n, int min_dist);
 size_t rec_encode(const Pt *pts, size_t n, int min_dist,
                   char *out, size_t out_cap); // 仅供 OSD/日志
@@ -173,8 +173,8 @@ int rec_match_path(const Pt *pts, size_t n, int min_dist,
 
 - **解析器用 inih（不自研）**：SAX 回调 `handler(user, section, name, value)`，在回调里增量构建模型。手势 key 只接受九宫格八方向，连续重复方向先折叠；同一节内标准化后重复的模板由最后定义覆盖并计入诊断。编译期开关 `INI_ALLOW_MULTILINE`/`INI_ALLOW_INLINE_COMMENTS` 等按需打开；UTF-8 按字节透明，启动时剥掉可能的 BOM。
 - 数据模型：`Config { General; Gesture[] global; App[] apps; }`，`App { name; Gesture[]; enabled; }`。
-- **写回**：inih 只读；唯一需持久化的是托盘切换 `AutoStart`，写回那一行自行处理（或改用 minIni 的 `ini_puts` 内建写）。
-- **热加载**：用 `ReadDirectoryChangesW` 或简单地在托盘菜单点"重载"时重读；一期先做手动重载 + 启动加载，二期加文件监听。
+- **写回**：inih 只读；唯一需持久化的是托盘切换 `AutoStart`，由纯文本编辑模块只改写对应行并原子替换配置文件。
+- **热加载**：后台线程用 `FindFirstChangeNotificationW` 监听配置目录；收到通知后计算目标文件的内容指纹，只在 ini 实际变化时通知主线程重读，托盘菜单仍保留手动“重载配置”。
 - 解析失败要**容错**：inih 返回出错行号，坏行跳过并记 log，不整体崩溃。
 
 ### 4.4 context — 前台程序识别与 per-app 解析
@@ -211,7 +211,7 @@ action = recognizer.match(points, candidates)               // 同一评分空�
 | `run:` | 运行程序 / 打开文件，如 `run:C:\tools\a.exe` | `ShellExecuteW`（支持文件/URL）或 `CreateProcessW` |
 | `cmd:` | 内置命令 | 硬编码命令表 |
 
-**内置命令表（一期）：** `close_window`（向锁定的目标窗口发 `WM_CLOSE`）、`minimize`、`maximize`、`restore`、`toggle_maximize`（已最大化则还原，否则最大化）、`scroll_top`、`scroll_bottom`、`volume_up`、`volume_down`、`volume_mute`、`media_play`、`copy`、`paste`。
+**内置命令表：** `close_window`（向锁定的目标窗口发 `WM_CLOSE`）、`minimize`、`maximize`、`restore`、`toggle_maximize`（已最大化则还原，否则最大化）、`scroll_top`、`scroll_bottom`、`volume_up`、`volume_down`、`volume_mute`、`media_play`、`copy`、`paste`、`open_exe_dir`。`cmd:none` 表示显式无动作，可在 per-app 中屏蔽全局手势且不回落。
 
 > 注意 `cmd:close_window` 操作的是**手势开始时锁定的目标窗口**，而非执行时的前台窗口——因为浮层/时序可能已让焦点变化。
 
@@ -231,9 +231,9 @@ action = recognizer.match(points, candidates)               // 同一评分空�
 - 单实例：命名互斥量 `CreateMutexW`，重复启动则退出并前置提示。
 - 退出：`UnhookWindowsHookEx`、`Shell_NotifyIcon(NIM_DELETE)`、GDI+ Shutdown。
 
-**默认管理员权限运行：** manifest 设 `requestedExecutionLevel level="requireAdministrator"`。收益是钩子可覆盖提权窗口；代价是启动会过 UAC、且**默认无法接收来自非提权程序的拖放**（本工具不涉及拖放，无碍）。若日后想避免 UAC 又保留提权，可考虑签名 + UIAccess，但一期不做。
+**默认管理员权限运行：** manifest 设 `requestedExecutionLevel level="requireAdministrator"`。收益是钩子可覆盖提权窗口；代价是启动会过 UAC、且**默认无法接收来自非提权程序的拖放**（本工具不涉及拖放，无碍）。若日后想避免 UAC 又保留提权，可考虑签名 + UIAccess，当前不做。
 
-**开机自启（`AutoStart`）：** 因默认提权，**不用注册表 `Run` 键**（每次开机会弹 UAC）。改用**任务计划程序**：创建一个登录触发、勾选"以最高权限运行"的任务，即可静默提权自启。实现上启动时把 `AutoStart` 的值与计划任务状态**对账**（true 则创建/更新任务，false 则删除），托盘菜单的"开机自启"项切换同一状态。创建任务用 `ITaskService` COM 接口，或首版先调用 `schtasks.exe /create /rl highest /sc onlogon` 简化。
+**开机自启（`AutoStart`）：** 因默认提权，**不用注册表 `Run` 键**（每次开机会弹 UAC）。改用**任务计划程序**：创建一个登录触发、勾选“以最高权限运行”的任务，即可静默提权自启。实现上启动时把 `AutoStart` 的值与计划任务状态**对账**（true 则创建/更新任务，false 则删除），托盘菜单的“开机自启”项切换同一状态。任务通过 `ITaskService` COM 接口直接创建，不启动 `schtasks.exe`、不落临时 XML；任务设置为不受默认运行时长限制，并允许在电池供电时启动。
 
 ---
 
@@ -271,10 +271,20 @@ ShowActionName  = true       ; 手势结束显示动作名
 TrailArrow      = true       ; 轨迹末端画方向箭头
 RandomColor     = false      ; 轨迹随机颜色
 TrailColor      = 00A0FF     ; 手势颜色 RRGGBB
-FailColor       = CAD0D3     ; 失败颜色 RRGGBB
+FailColor       = 666666     ; 失败颜色 RRGGBB
 TrailWidth      = 3          ; 轨迹线宽
+TrailMaxLength  = 2500       ; 仅限制绘制的轨迹长度，不影响识别
 TextSize        = 26         ; 动作名字号
 TextPosition    = 150        ; 动作名距屏幕底部高度（px）
+TextFillColor   = FFFFFF     ; 动作名填充色 RRGGBB
+TextOutlineWidth= 3          ; 动作名描边宽度（px）
+TextLetterSpacing = 4        ; 动作名字间距（px）
+
+; --- 自动更新 ---
+[Update]
+Enabled         = true       ; 总开关；false 时不联网检查
+AutoCheck       = true       ; 启动时后台检查，发现新版只提示
+Channel         = stable     ; stable | beta
 
 ; ---------- 全局默认手势：方向串 = 动作（重复方向会折叠，非法/重复项写日志） ----------
 [Gestures]
@@ -287,9 +297,11 @@ TextPosition    = 150        ; 动作名距屏幕底部高度（px）
 8  = cmd:scroll_top       ; ↑ 上      滚动到顶部
 9  = cmd:toggle_maximize  ; ↗ 右上    最大化 / 还原（切换）
 26 = cmd:close_window     ; ↓→ 下右   关闭窗口
+39 = key:f5               ; ↘↗ V 形   刷新
+86 = cmd:open_exe_dir     ; ↑→ 上右   打开 hua 所在目录
 
-; 注意：2(向下) 与 26(下右) 为前缀关系。最终按完整原始轨迹联合评分；
-; 候选过于接近时由 AmbiguityMargin 拒识，不猜测其中一个。
+; 注意：2(向下) 与 26(下右) 为前缀关系。已达到 MinDistance 但尚未确认的末段
+; 会作为候选意图参与评分，避免未画完 26 时先执行 2；候选过近时也会拒识。
 
 ; ---------- 程序专属覆盖 ----------
 [App:chrome.exe]
@@ -316,22 +328,30 @@ hua/
 ├─ config/
 │  └─ hua.ini            # 默认配置，随发布包分发
 ├─ src/
-│  ├─ main.c                  # app：入口 / 消息循环 / 托盘 / 单实例
+│  ├─ main.c                  # app：入口 / 消息循环 / 托盘 / 单实例 / 配置监听
 │  ├─ hook.c  hook.h          # WH_MOUSE_LL、触发状态机、右键还原
 │  ├─ recognizer.c .h         # RDP/分段/DTW/形状评分与拒识（纯逻辑）
-│  ├─ config.c .h             # ini 解析 / 数据模型 / 热加载
+│  ├─ config.c .h             # ini 解析 / 数据模型 / 候选解析
 │  ├─ context.c .h            # 前台 exe / per-app 解析
 │  ├─ action.c .h             # key / run / cmd
 │  ├─ overlay.c .h            # 分层窗口 + GDI+ 绘制
+│  ├─ autostart.c .h          # 任务计划程序 COM 自启
+│  ├─ update.c .h             # GitHub Release 自动更新
+│  ├─ watchdog.c .h           # 钩子探活判定（纯逻辑）
 │  └─ platform.c .h           # 编码转换 / 通用工具 / 日志
 ├─ third_party/
 │  ├─ ini.c  ini.h            # inih（benhoyt/inih，New BSD）
 │  └─ utest.h                 # 单头测试框架
 ├─ tests/
-│  ├─ test_recognizer.c       # 分段 / 几何匹配 / 歧义拒识 / 随机矩阵
-│  └─ test_config.c           # ini 解析边界用例
+│  ├─ test_recognizer.c       # 分段 / 匹配 / 前缀安全 / 性质与负载回归
+│  ├─ test_config.c           # ini 解析 / 标准化 / 候选解析边界
+│  ├─ test_action.c           # 动作语法解析
+│  ├─ test_watchdog.c         # 钩子探活判定
+│  ├─ test_ini_edit.c         # AutoStart 配置写回
+│  └─ test_logging.c          # 日志轮转与保留
 └─ .github/workflows/
-   └─ build.yml               # 构建 + 打包 + Release
+   ├─ ci.yml                  # 三架构构建、测试、PE/依赖校验
+   └─ release.yml             # 标签校验、打包、校验和与 Release
 ```
 
 ---
@@ -340,22 +360,8 @@ hua/
 
 - **CMake**：`set(CMAKE_C_STANDARD 17)` + `set(CMAKE_C_STANDARD_REQUIRED ON)`；`add_executable(hua WIN32 ...)`（`WIN32` 去掉控制台窗口）；链接 `gdiplus user32 shell32 gdi32`。MSVC 用 `/std:c17`，MinGW 用 `-std=c17`。
 - **测试**：`enable_testing()` + `add_test`；`recognizer`/`config` 编译为静态库供主程序与测试共用。
-- **GitHub Actions**（`windows-latest`）：配置 → 构建 Release → 跑 CTest → 打包 `hua.exe + hua.ini` 为 zip → 打 tag 时发布 Release。与你现有的"GitHub Actions 构建 + Release 自动升级"流程一致。
-
-```yaml
-# build.yml 骨架
-on: [push, pull_request]
-jobs:
-  build:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: cmake -B build -DCMAKE_BUILD_TYPE=Release
-      - run: cmake --build build --config Release
-      - run: ctest --test-dir build -C Release --output-on-failure
-      - uses: actions/upload-artifact@v4
-        with: { name: hua, path: build/Release/hua.exe }
-```
+- **CI（`ci.yml`）**：main/master 推送与 PR 均构建 x64、x86、ARM64；x64/x86 执行 CTest，ARM64 在 x64 runner 上做编译校验；三者都校验 PE Machine 字段与静态 CRT（不得导入 VCRUNTIME/UCRT 转发 DLL）。
+- **发布（`release.yml`）**：推送 `v*` 标签后先校验标签与 `src/version.h`；三架构重复构建、测试和依赖校验，再生成单文件 exe、含默认配置与许可证的 zip、`checksums.txt`，最后从 CHANGELOG 对应章节生成 Release 说明。带连字符的标签作为预发布。
 
 ---
 
@@ -364,12 +370,17 @@ jobs:
 纯逻辑层是测试重点（无 Win32、可脱离系统运行）：
 
 - **recognizer**
-  - RDP/迟滞分段：直线各方向、L/Z/V、真实用户轨迹、短尾钩和含抖动噪声点。
-  - 几何匹配：尺寸/采样密度不变性、方向边界歧义拒识、最低分拒识。
+  - RDP/迟滞分段：直线各方向、L/Z/V、短尾钩、含抖动噪声点，以及 `MinDistance` 到自适应确认距离的边界矩阵。
+  - 前缀安全：已配置延伸候选时，未完成末段不得执行短前缀；未配置对应延伸时允许把小钩视为噪声。默认危险组合 `3=Delete` / `39=F5` 有配置层集成回归。
+  - 几何匹配：尺寸/采样密度/平移不变性、方向边界歧义拒识、最低分拒识、V/原路折返拓扑连续扫描。
   - 232 组确定性随机变体：八个单方向与默认多段手势的角度、长度、密度、噪声矩阵。
+  - 边界与负载：4096 输入点、192 候选的确定性结果，输出缓冲不足的原子失败，以及 `INT_MIN`/`INT_MAX` 坐标下分数有界。
+  - 真实数据：目前只保留了 2026-07-17 日志中的一条 V 形轨迹作为回归；其余均明确为确定性合成样本。真实误识/漏识语料仍需随用户日志持续扩充。
 - **config**
   - 正常解析、缺失可选项取默认、坏行跳过、UTF-8 中文动作名/路径、`[App:x]` 覆盖优先级、`Enabled=false`。
-- **context / hook / overlay / action**：依赖系统 API，用手动冒烟测试清单（见下）覆盖，不做自动化单测。
+  - 全局与 app 模板统一做合法性校验、连续重复折叠、长度边界和“后定义覆盖前定义”诊断。
+- **其他自动测试**：动作字符串解析、钩子 watchdog 纯逻辑、AutoStart 行写回、日志轮转/保留。
+- **context / hook 安装与事件链 / overlay / action 系统调用 / autostart COM**：依赖 Windows 交互状态，继续由手动冒烟测试覆盖。
 
 **冒烟测试清单**（手动）：右键点击仍能弹出系统菜单（补发正确）；黑名单程序内手势不触发；per-app 覆盖在浏览器生效；高 DPI 下轨迹坐标正确；改 ini + 重载即时生效；SendInput 合成事件不被自身钩子二次处理。
 
@@ -385,7 +396,7 @@ jobs:
 3. ✅ **M3 配置化**：inih 解析 + 数据模型 + `Trigger`/阈值可配 + 托盘重载。
 4. ✅ **M4 增强**：per-app 映射 + 黑白名单 + 全屏门控。
 5. ✅ **M5 浮层**：GDI+ 抗锯齿轨迹线 + 箭头 + 实时动作名 OSD + 淡出（自绘 flat C 声明）。
-6. ✅ **M6 打磨**：热加载（`FindFirstChangeNotification`）、DPI 感知（PerMonitorV2）、开机自启（schtasks）、CI 发布、README。
+6. ✅ **M6 打磨**：热加载（`FindFirstChangeNotificationW`）、DPI 感知（PerMonitorV2）、开机自启（任务计划程序 COM）、CI 发布、README。
 7. ✅ **M7 几何识别重构**：RDP + 自适应转向迟滞 + 连续角度/DTW/转角/形状联合评分 + 双阈值拒识。
 
 ---
@@ -396,7 +407,7 @@ jobs:
 - **钩子性能**：回调必须微秒级返回，绝不在其中绘制/读文件；违反会被系统摘钩子且拖慢全局鼠标。
 - **提权窗口**：已通过默认管理员运行解决（钩子可覆盖提权窗口）；副作用是启动过 UAC、默认不接收非提权程序拖放（本工具无碍）。
 - **自启与 UAC**：提权程序切忌用注册表 `Run` 键自启（每次开机弹 UAC）——必须用任务计划程序 + 最高权限静默启动。
-- **高 DPI / 多屏**：坐标需按 per-monitor DPI 处理；一期先声明 DPI 感知（manifest `PerMonitorV2`）保证主屏正确。全屏几何比对也要用 DPI 感知后的物理像素。
+- **高 DPI / 多屏**：manifest 已声明 `PerMonitorV2`，输入、浮层与全屏几何比对统一使用物理像素；仍需在混合缩放比例、负坐标副屏和跨屏绘制场景做发布前冒烟。
 - **编码**：全程 UTF-8 文件 + UTF-16 内部，边界统一转码，杜绝中文乱码。
 
 ---
@@ -410,4 +421,3 @@ jobs:
 - Chance-fyi/mouse-gestures（RDP、关键点与多特征匹配） — https://github.com/Chance-fyi/mouse-gestures
 - Foxy Gestures（方向迟滞与非均匀扇区参考） — https://github.com/marklieberman/foxygestures
 - Easystroke（Linux C++ 手势工具，架构参考） — https://github.com/thjaeger/easystroke
-```
